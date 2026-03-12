@@ -1944,6 +1944,12 @@ impl Dataset {
                     if let Some(skip_merge) = kwargs.get_item("skip_merge")? {
                         params = params.skip_merge(skip_merge.extract()?);
                     }
+                    if let Some(memory_limit) = kwargs.get_item("memory_limit")? {
+                        params = params.memory_limit_mb(memory_limit.extract()?);
+                    }
+                    if let Some(num_workers) = kwargs.get_item("num_workers")? {
+                        params = params.num_workers(num_workers.extract()?);
+                    }
                 }
                 Box::new(params)
             }

@@ -20,7 +20,7 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use lance_arrow::json::JSON_EXT_NAME;
 use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
-use lance_core::utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu};
+use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
 use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
 use lance_io::object_store::ObjectStore;
@@ -40,30 +40,21 @@ use tracing::instrument;
 // WARNING: changing this value will break the compatibility with existing indexes
 pub const BLOCK_SIZE: usize = BitPacker4x::BLOCK_LEN;
 
-// the number of shards to split the indexing work,
-// the indexing process would spawn `LANCE_FTS_NUM_SHARDS` workers to build FTS,
-// higher for faster indexing performance, but more memory usage,
-// it's `the number of compute intensive CPUs` by default
+// The default number of workers to use for FTS builds.
+// By default this is roughly `num_cpus / 2`, but it can be overridden
+// with `LANCE_FTS_NUM_SHARDS`.
 pub static LANCE_FTS_NUM_SHARDS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_NUM_SHARDS")
-        .unwrap_or_else(|_| get_num_compute_intensive_cpus().to_string())
+        .unwrap_or_else(|_| default_num_workers().to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_NUM_SHARDS")
 });
-// the partition size limit in MiB (uncompressed format)
-// higher for better indexing & query performance, but more memory usage,
+// The default per-worker memory limit in MiB for FTS builds.
 pub static LANCE_FTS_PARTITION_SIZE: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_PARTITION_SIZE")
-        .unwrap_or_else(|_| "1024".to_string())
+        .unwrap_or_else(|_| "2048".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_PARTITION_SIZE")
-});
-// the target size of final partition output in MiB
-pub static LANCE_FTS_TARGET_SIZE: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("LANCE_FTS_TARGET_SIZE")
-        .unwrap_or_else(|_| "4096".to_string())
-        .parse()
-        .expect("failed to parse LANCE_FTS_TARGET_SIZE")
 });
 static LANCE_FTS_WRITE_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_WRITE_QUEUE_SIZE")
@@ -71,83 +62,26 @@ static LANCE_FTS_WRITE_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
         .parse()
         .expect("failed to parse LANCE_FTS_WRITE_QUEUE_SIZE")
 });
-static LANCE_FTS_DEBUG_MEMORY: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("LANCE_FTS_DEBUG_MEMORY")
-        .map(|value| value != "0")
-        .unwrap_or(false)
-});
-#[cfg(target_os = "linux")]
-static LANCE_FTS_TRIM_ALLOC: LazyLock<bool> = LazyLock::new(|| {
-    std::env::var("LANCE_FTS_TRIM_ALLOC")
-        .map(|value| value != "0")
-        .unwrap_or(false)
-});
 
-fn current_rss_bytes() -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let status = std::fs::read_to_string("/proc/self/status").ok()?;
-        let rss_kb = status
-            .lines()
-            .find_map(|line| line.strip_prefix("VmRSS:"))
-            .and_then(|line| line.split_whitespace().next())
-            .and_then(|value| value.parse::<u64>().ok())?;
-        Some(rss_kb * 1024)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
-    }
+fn default_num_workers() -> usize {
+    let total_cpus = get_num_compute_intensive_cpus() + *IO_CORE_RESERVATION;
+    std::cmp::max(1, total_cpus / 2)
 }
 
-fn maybe_trim_allocator() {
-    #[cfg(target_os = "linux")]
-    if *LANCE_FTS_TRIM_ALLOC {
-        unsafe {
-            libc::malloc_trim(0);
-        }
-    }
+fn resolve_num_workers(params: &InvertedIndexParams) -> usize {
+    let max_workers = get_num_compute_intensive_cpus().max(1);
+    params
+        .num_workers
+        .unwrap_or(*LANCE_FTS_NUM_SHARDS)
+        .clamp(1, max_workers)
 }
 
-fn log_memory_debug(
-    event: &str,
-    partition_id: u64,
-    docs: usize,
-    tokens: usize,
-    tracked_memory_bytes: u64,
-    token_set_bytes: u64,
-    doc_set_bytes: u64,
-    posting_lists_overhead_bytes: u64,
-    posting_lists_payload_bytes: u64,
-    rss_bytes: Option<u64>,
-) {
-    if !*LANCE_FTS_DEBUG_MEMORY {
-        return;
-    }
-
-    let rss_mb = rss_bytes
-        .map(|bytes| format!("{:.2}", bytes as f64 / 1024.0 / 1024.0))
-        .unwrap_or_else(|| "unknown".to_string());
-    let accounted_bytes = token_set_bytes
-        + doc_set_bytes
-        + posting_lists_overhead_bytes
-        + posting_lists_payload_bytes;
-    let unaccounted_bytes = tracked_memory_bytes.saturating_sub(accounted_bytes);
-    log::info!(
-        "fts_memory event={} partition={} docs={} tokens={} tracked_memory_mb={:.2} token_set_mb={:.2} doc_set_mb={:.2} posting_overhead_mb={:.2} posting_payload_mb={:.2} unaccounted_mb={:.2} rss_mb={}",
-        event,
-        partition_id,
-        docs,
-        tokens,
-        tracked_memory_bytes as f64 / 1024.0 / 1024.0,
-        token_set_bytes as f64 / 1024.0 / 1024.0,
-        doc_set_bytes as f64 / 1024.0 / 1024.0,
-        posting_lists_overhead_bytes as f64 / 1024.0 / 1024.0,
-        posting_lists_payload_bytes as f64 / 1024.0 / 1024.0,
-        unaccounted_bytes as f64 / 1024.0 / 1024.0,
-        rss_mb,
-    );
+fn resolve_worker_memory_limit_bytes(params: &InvertedIndexParams, num_workers: usize) -> u64 {
+    let default_worker_memory_limit_bytes = *LANCE_FTS_PARTITION_SIZE << 20;
+    params
+        .memory_limit_mb
+        .map(|memory_limit_mb| (memory_limit_mb << 20) / num_workers as u64)
+        .unwrap_or(default_worker_memory_limit_bytes)
 }
 
 #[derive(Debug)]
@@ -245,15 +179,11 @@ impl InvertedIndexBuilder {
 
     #[instrument(level = "debug", skip_all)]
     async fn update_index(&mut self, stream: SendableRecordBatchStream) -> Result<()> {
-        let num_workers = *LANCE_FTS_NUM_SHARDS;
+        let num_workers = resolve_num_workers(&self.params);
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
-        let target_partition_size_bytes = *LANCE_FTS_TARGET_SIZE << 20;
-        let worker_memory_limit_bytes = self
-            .params
-            .worker_memory_limit_mb
-            .unwrap_or(*LANCE_FTS_PARTITION_SIZE)
-            << 20;
+        let worker_memory_limit_bytes =
+            resolve_worker_memory_limit_bytes(&self.params, num_workers);
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let tokenized_count = Arc::new(AtomicU64::new(0));
@@ -276,7 +206,6 @@ impl InvertedIndexBuilder {
                     id_alloc,
                     fragment_mask,
                     token_set_format,
-                    target_partition_size_bytes,
                     worker_memory_limit_bytes,
                 )
                 .await?;
@@ -677,7 +606,6 @@ struct IndexWorker {
     partitions: Vec<u64>,
     schema: SchemaRef,
     memory_size: u64,
-    target_partition_size_bytes: u64,
     worker_memory_limit_bytes: u64,
     total_doc_length: usize,
     fragment_mask: Option<u64>,
@@ -720,7 +648,6 @@ impl IndexWorker {
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
         token_set_format: TokenSetFormat,
-        target_partition_size_bytes: u64,
         worker_memory_limit_bytes: u64,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
@@ -738,7 +665,6 @@ impl IndexWorker {
             id_alloc,
             schema,
             memory_size: 0,
-            target_partition_size_bytes,
             worker_memory_limit_bytes,
             total_doc_length: 0,
             fragment_mask,
@@ -891,7 +817,6 @@ impl IndexWorker {
             }
 
             if self.builder.docs.len() as u32 == u32::MAX
-                || self.memory_size >= self.target_partition_size_bytes
                 || (!builder_was_empty && self.memory_size >= self.worker_memory_limit_bytes)
             {
                 self.flush().await?;
@@ -907,31 +832,6 @@ impl IndexWorker {
             return Ok(());
         }
 
-        let partition_id = self.builder.id();
-        let docs_in_partition = self.builder.docs.len();
-        let tokens_in_partition = self.builder.tokens.len();
-        let tracked_memory_bytes = self.memory_size;
-        let token_set_bytes = self.builder.tokens.memory_size() as u64;
-        let doc_set_bytes = self.builder.docs.memory_size() as u64;
-        let posting_lists_overhead_bytes = self.posting_lists_overhead_size();
-        let posting_lists_payload_bytes = self
-            .builder
-            .posting_lists
-            .iter()
-            .map(PostingListBuilder::size)
-            .sum::<u64>();
-        log_memory_debug(
-            "before_flush",
-            partition_id,
-            docs_in_partition,
-            tokens_in_partition,
-            tracked_memory_bytes,
-            token_set_bytes,
-            doc_set_bytes,
-            posting_lists_overhead_bytes,
-            posting_lists_payload_bytes,
-            current_rss_bytes(),
-        );
         log::info!(
             "flushing posting lists, memory size: {} MiB",
             self.memory_size / (1024 * 1024)
@@ -949,33 +849,8 @@ impl IndexWorker {
             ),
         );
         builder.write(self.store.as_ref()).await?;
-        log_memory_debug(
-            "after_write_before_drop",
-            partition_id,
-            docs_in_partition,
-            tokens_in_partition,
-            tracked_memory_bytes,
-            token_set_bytes,
-            doc_set_bytes,
-            posting_lists_overhead_bytes,
-            posting_lists_payload_bytes,
-            current_rss_bytes(),
-        );
         let written_partition_id = builder.id();
         drop(builder);
-        maybe_trim_allocator();
-        log_memory_debug(
-            "after_drop",
-            partition_id,
-            docs_in_partition,
-            tokens_in_partition,
-            tracked_memory_bytes,
-            token_set_bytes,
-            doc_set_bytes,
-            posting_lists_overhead_bytes,
-            posting_lists_payload_bytes,
-            current_rss_bytes(),
-        );
         self.partitions.push(written_partition_id);
         Ok(())
     }
@@ -1629,7 +1504,6 @@ mod tests {
             None,
             token_set_format,
             u64::MAX,
-            u64::MAX,
         )
         .await?;
         worker1
@@ -1644,7 +1518,6 @@ mod tests {
             id_alloc.clone(),
             None,
             token_set_format,
-            u64::MAX,
             u64::MAX,
         )
         .await?;
@@ -1934,7 +1807,7 @@ mod tests {
         let stream = Box::pin(stream);
 
         let mut builder =
-            InvertedIndexBuilder::new(InvertedIndexParams::default().worker_memory_limit_mb(0));
+            InvertedIndexBuilder::new(InvertedIndexParams::default().memory_limit_mb(0));
         let err = builder
             .update(stream, store.as_ref())
             .await
@@ -1943,6 +1816,43 @@ mod tests {
             err.to_string().contains("row_id=42"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_resolve_worker_memory_limit_uses_default_when_unset() {
+        let params = InvertedIndexParams::default();
+        assert_eq!(
+            resolve_worker_memory_limit_bytes(&params, 8),
+            *LANCE_FTS_PARTITION_SIZE << 20
+        );
+    }
+
+    #[test]
+    fn test_resolve_num_workers_uses_default_when_unset() {
+        let expected = default_num_workers().clamp(1, get_num_compute_intensive_cpus().max(1));
+        assert_eq!(
+            resolve_num_workers(&InvertedIndexParams::default()),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_resolve_num_workers_clamps_requested_value() {
+        let max_workers = get_num_compute_intensive_cpus().max(1);
+        assert_eq!(
+            resolve_num_workers(&InvertedIndexParams::default().num_workers(0)),
+            1
+        );
+        assert_eq!(
+            resolve_num_workers(&InvertedIndexParams::default().num_workers(max_workers + 10)),
+            max_workers
+        );
+    }
+
+    #[test]
+    fn test_resolve_worker_memory_limit_splits_total_memory_limit() {
+        let params = InvertedIndexParams::default().memory_limit_mb(4096);
+        assert_eq!(resolve_worker_memory_limit_bytes(&params, 16), 256 << 20);
     }
 
     #[tokio::test]

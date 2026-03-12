@@ -2610,6 +2610,19 @@ class LanceDataset(pa.dataset.Dataset):
             This is for the ``INVERTED`` index. If True, the index will skip the
             partition merge stage after indexing. This can be useful for
             distributed/fragment-level indexing where a later merge is desired.
+        memory_limit: int, optional
+            This is for the ``INVERTED`` index. Total build-time memory limit in MiB.
+            If set, Lance divides this budget evenly across FTS workers. By default
+            Lance uses roughly ``num_cpus / 2`` workers unless
+            ``LANCE_FTS_NUM_SHARDS`` is set. If unset, each worker defaults to a
+            2 GiB build-time memory limit. This parameter is only used for the
+            current build and is not persisted with the index.
+        num_workers: int, optional
+            This is for the ``INVERTED`` index. Number of FTS workers to use for
+            the current build. The effective worker count is clamped to
+            ``[1, num_cpus - 2]``. If unset, Lance uses roughly ``num_cpus / 2``
+            workers unless ``LANCE_FTS_NUM_SHARDS`` is set. This parameter is
+            only used for the current build and is not persisted with the index.
         base_tokenizer: str, default "simple"
             This is for the ``INVERTED`` index. The base tokenizer to use. The
             value can be:
