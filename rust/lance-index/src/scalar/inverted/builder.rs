@@ -6,6 +6,7 @@ use crate::scalar::IndexStore;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::lance_tokenizer::DocType;
 use crate::scalar::inverted::tokenizer::lance_tokenizer::LanceTokenizer;
+#[cfg(test)]
 use crate::scalar::lance_format::LanceIndexStore;
 use crate::vector::graph::OrderedFloat;
 use crate::{progress::IndexBuildProgress, progress::noop_progress};
@@ -22,7 +23,7 @@ use lance_arrow::{ARROW_EXT_NAME_KEY, iter_str_array};
 use lance_core::cache::LanceCache;
 use lance_core::utils::tokio::{IO_CORE_RESERVATION, get_num_compute_intensive_cpus, spawn_cpu};
 use lance_core::{Error, ROW_ID, ROW_ID_FIELD, Result};
-use lance_core::{error::LanceOptionExt, utils::tempfile::TempDir};
+use lance_core::error::LanceOptionExt;
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
 use smallvec::SmallVec;
@@ -91,9 +92,7 @@ pub struct InvertedIndexBuilder {
     new_partitions: Vec<u64>,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
-    _tmpdir: TempDir,
-    local_store: Arc<dyn IndexStore>,
-    src_store: Arc<dyn IndexStore>,
+    src_store: Option<Arc<dyn IndexStore>>,
     progress: Arc<dyn IndexBuildProgress>,
 }
 
@@ -125,20 +124,11 @@ impl InvertedIndexBuilder {
         token_set_format: TokenSetFormat,
         fragment_mask: Option<u64>,
     ) -> Self {
-        let tmpdir = TempDir::default();
-        let local_store = Arc::new(LanceIndexStore::new(
-            ObjectStore::local().into(),
-            tmpdir.obj_path(),
-            Arc::new(LanceCache::no_cache()),
-        ));
-        let src_store = store.unwrap_or_else(|| local_store.clone());
         Self {
             params,
             partitions,
             new_partitions: Vec::new(),
-            _tmpdir: tmpdir,
-            local_store,
-            src_store,
+            src_store: store,
             token_set_format,
             fragment_mask,
             progress: noop_progress(),
@@ -171,14 +161,18 @@ impl InvertedIndexBuilder {
         self.progress
             .stage_start("tokenize_docs", None, "rows")
             .await?;
-        self.update_index(new_data).await?;
+        self.update_index(new_data, dest_store).await?;
         self.progress.stage_complete("tokenize_docs").await?;
         self.write(dest_store).await?;
         Ok(())
     }
 
     #[instrument(level = "debug", skip_all)]
-    async fn update_index(&mut self, stream: SendableRecordBatchStream) -> Result<()> {
+    async fn update_index(
+        &mut self,
+        stream: SendableRecordBatchStream,
+        dest_store: &dyn IndexStore,
+    ) -> Result<()> {
         let num_workers = resolve_num_workers(&self.params);
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
@@ -188,11 +182,12 @@ impl InvertedIndexBuilder {
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let tokenized_count = Arc::new(AtomicU64::new(0));
         let (sender, receiver) = async_channel::bounded(num_workers);
+        let (builder_tx, builder_rx) = async_channel::bounded::<InnerBuilder>(1);
         let mut index_tasks = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
-            let store = self.local_store.clone();
             let tokenizer = tokenizer.clone();
             let receiver: async_channel::Receiver<RecordBatch> = receiver.clone();
+            let builder_tx = builder_tx.clone();
             let id_alloc = id_alloc.clone();
             let progress = self.progress.clone();
             let fragment_mask = self.fragment_mask;
@@ -200,8 +195,8 @@ impl InvertedIndexBuilder {
             let tokenized_count = tokenized_count.clone();
             index_tasks.push(tokio::task::spawn(async move {
                 let mut worker = IndexWorker::new(
-                    store,
                     tokenizer,
+                    builder_tx,
                     with_position,
                     id_alloc,
                     fragment_mask,
@@ -225,6 +220,14 @@ impl InvertedIndexBuilder {
         // Keep the channel lifetime tied to the worker tasks so senders observe
         // worker exits instead of blocking on an orphaned receiver handle.
         drop(receiver);
+        drop(builder_tx);
+
+        let writer = async {
+            while let Ok(mut builder) = builder_rx.recv().await {
+                builder.write(dest_store).await?;
+            }
+            Result::Ok(())
+        };
 
         let mut stream = Box::pin(stream);
         log::info!("indexing FTS with {} workers", num_workers);
@@ -263,6 +266,7 @@ impl InvertedIndexBuilder {
         for index_task in index_tasks {
             self.new_partitions.extend(index_task.await??);
         }
+        writer.await?;
         log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
         Ok(())
     }
@@ -386,12 +390,18 @@ impl InvertedIndexBuilder {
         let mut copied = 0;
         for part in self.partitions.iter() {
             self.src_store
+                .as_ref()
+                .expect("existing partitions require a source store")
                 .copy_index_file(&token_file_path(*part), dest_store)
                 .await?;
             self.src_store
+                .as_ref()
+                .expect("existing partitions require a source store")
                 .copy_index_file(&posting_file_path(*part), dest_store)
                 .await?;
             self.src_store
+                .as_ref()
+                .expect("existing partitions require a source store")
                 .copy_index_file(&doc_file_path(*part), dest_store)
                 .await?;
             copied += 1;
@@ -399,16 +409,7 @@ impl InvertedIndexBuilder {
                 .stage_progress("copy_partitions", copied)
                 .await?;
         }
-        for part in self.new_partitions.iter() {
-            self.local_store
-                .copy_index_file(&token_file_path(*part), dest_store)
-                .await?;
-            self.local_store
-                .copy_index_file(&posting_file_path(*part), dest_store)
-                .await?;
-            self.local_store
-                .copy_index_file(&doc_file_path(*part), dest_store)
-                .await?;
+        for _part in self.new_partitions.iter() {
             copied += 1;
             self.progress
                 .stage_progress("copy_partitions", copied)
@@ -599,8 +600,8 @@ impl InnerBuilder {
 }
 
 struct IndexWorker {
-    store: Arc<dyn IndexStore>,
     tokenizer: Box<dyn LanceTokenizer>,
+    builder_tx: async_channel::Sender<InnerBuilder>,
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
     partitions: Vec<u64>,
@@ -642,8 +643,8 @@ impl IndexWorker {
     }
 
     async fn new(
-        store: Arc<dyn IndexStore>,
         tokenizer: Box<dyn LanceTokenizer>,
+        builder_tx: async_channel::Sender<InnerBuilder>,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
@@ -653,8 +654,8 @@ impl IndexWorker {
         let schema = inverted_list_schema(with_position);
 
         Ok(Self {
-            store,
             tokenizer,
+            builder_tx,
             builder: InnerBuilder::new(
                 id_alloc.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                     | fragment_mask.unwrap_or(0),
@@ -838,7 +839,7 @@ impl IndexWorker {
         );
         self.memory_size = 0;
         let with_position = self.has_position();
-        let mut builder = std::mem::replace(
+        let builder = std::mem::replace(
             &mut self.builder,
             InnerBuilder::new(
                 self.id_alloc
@@ -848,9 +849,13 @@ impl IndexWorker {
                 self.token_set_format,
             ),
         );
-        builder.write(self.store.as_ref()).await?;
         let written_partition_id = builder.id();
-        drop(builder);
+        self.builder_tx.send(builder).await.map_err(|err| {
+            Error::execution(format!(
+                "failed to send finalized partition {} to writer: {err}",
+                written_partition_id
+            ))
+        })?;
         self.partitions.push(written_partition_id);
         Ok(())
     }
@@ -1495,10 +1500,11 @@ mod tests {
         let tokenizer = params.build()?;
         let token_set_format = TokenSetFormat::default();
         let id_alloc = Arc::new(AtomicU64::new(0));
+        let (builder_tx, builder_rx) = async_channel::bounded(2);
 
         let mut worker1 = IndexWorker::new(
-            src_store.clone(),
             tokenizer.clone(),
+            builder_tx.clone(),
             params.with_position,
             id_alloc.clone(),
             None,
@@ -1510,10 +1516,13 @@ mod tests {
             .process_batch(make_doc_batch("hello world", 0))
             .await?;
         let mut partitions = worker1.finish().await?;
+        while let Ok(mut builder) = builder_rx.try_recv() {
+            builder.write(src_store.as_ref()).await?;
+        }
 
         let mut worker2 = IndexWorker::new(
-            src_store.clone(),
             tokenizer.clone(),
+            builder_tx,
             params.with_position,
             id_alloc.clone(),
             None,
@@ -1528,6 +1537,13 @@ mod tests {
         partitions.sort_unstable();
         assert_eq!(partitions.len(), 2);
         assert_ne!(partitions[0], partitions[1]);
+
+        // Drain finalized builders and write them to the source store, mirroring the
+        // direct-to-destination writer task used by the production indexing path.
+        // The bounded channel size keeps these writes backpressured in normal execution.
+        while let Ok(mut builder) = builder_rx.try_recv() {
+            builder.write(src_store.as_ref()).await?;
+        }
 
         let builder = InvertedIndexBuilder::from_existing_index(
             InvertedIndexParams::default().skip_merge(true),
@@ -1858,6 +1874,12 @@ mod tests {
     #[tokio::test]
     async fn test_update_index_returns_worker_error_when_workers_exit_during_dispatch() {
         let num_batches = (*LANCE_FTS_NUM_SHARDS * 2 + 1) as u64;
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
         let schema = make_doc_batch("hello world", 0).schema();
         let stream = RecordBatchStreamAdapter::new(
             schema,
@@ -1869,10 +1891,10 @@ mod tests {
             InvertedIndexBuilder::new(InvertedIndexParams::default().skip_merge(true))
                 .with_progress(Arc::new(FailingProgress));
 
-        let result = tokio::time::timeout(Duration::from_secs(5), builder.update_index(stream))
-            .await
-            .expect("update_index should not hang")
-            .expect_err("worker failure should be returned");
+        let result = tokio::time::timeout(Duration::from_secs(5), builder.update_index(stream, store.as_ref()))
+                .await
+                .expect("update_index should not hang")
+                .expect_err("worker failure should be returned");
 
         assert!(
             result.to_string().contains("injected progress failure"),
