@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use super::{
-    InvertedIndexParams,
-    index::*,
-    merger::{Merger, PartitionSource, SizeBasedMerger},
-};
+use super::{InvertedIndexParams, index::*};
 use crate::scalar::IndexStore;
 use crate::scalar::inverted::json::JsonTextStream;
 use crate::scalar::inverted::lance_tokenizer::DocType;
@@ -58,17 +54,101 @@ pub static LANCE_FTS_NUM_SHARDS: LazyLock<usize> = LazyLock::new(|| {
 // higher for better indexing & query performance, but more memory usage,
 pub static LANCE_FTS_PARTITION_SIZE: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_PARTITION_SIZE")
-        .unwrap_or_else(|_| "256".to_string())
+        .unwrap_or_else(|_| "1024".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_PARTITION_SIZE")
 });
-// the target size of partition after merging in MiB (uncompressed format)
+// the target size of final partition output in MiB
 pub static LANCE_FTS_TARGET_SIZE: LazyLock<u64> = LazyLock::new(|| {
     std::env::var("LANCE_FTS_TARGET_SIZE")
         .unwrap_or_else(|_| "4096".to_string())
         .parse()
         .expect("failed to parse LANCE_FTS_TARGET_SIZE")
 });
+static LANCE_FTS_WRITE_QUEUE_SIZE: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_WRITE_QUEUE_SIZE")
+        .unwrap_or_else(|_| "1".to_string())
+        .parse()
+        .expect("failed to parse LANCE_FTS_WRITE_QUEUE_SIZE")
+});
+static LANCE_FTS_DEBUG_MEMORY: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_DEBUG_MEMORY")
+        .map(|value| value != "0")
+        .unwrap_or(false)
+});
+#[cfg(target_os = "linux")]
+static LANCE_FTS_TRIM_ALLOC: LazyLock<bool> = LazyLock::new(|| {
+    std::env::var("LANCE_FTS_TRIM_ALLOC")
+        .map(|value| value != "0")
+        .unwrap_or(false)
+});
+
+fn current_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let rss_kb = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())?;
+        Some(rss_kb * 1024)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+fn maybe_trim_allocator() {
+    #[cfg(target_os = "linux")]
+    if *LANCE_FTS_TRIM_ALLOC {
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+}
+
+fn log_memory_debug(
+    event: &str,
+    partition_id: u64,
+    docs: usize,
+    tokens: usize,
+    tracked_memory_bytes: u64,
+    token_set_bytes: u64,
+    doc_set_bytes: u64,
+    posting_lists_overhead_bytes: u64,
+    posting_lists_payload_bytes: u64,
+    rss_bytes: Option<u64>,
+) {
+    if !*LANCE_FTS_DEBUG_MEMORY {
+        return;
+    }
+
+    let rss_mb = rss_bytes
+        .map(|bytes| format!("{:.2}", bytes as f64 / 1024.0 / 1024.0))
+        .unwrap_or_else(|| "unknown".to_string());
+    let accounted_bytes = token_set_bytes
+        + doc_set_bytes
+        + posting_lists_overhead_bytes
+        + posting_lists_payload_bytes;
+    let unaccounted_bytes = tracked_memory_bytes.saturating_sub(accounted_bytes);
+    log::info!(
+        "fts_memory event={} partition={} docs={} tokens={} tracked_memory_mb={:.2} token_set_mb={:.2} doc_set_mb={:.2} posting_overhead_mb={:.2} posting_payload_mb={:.2} unaccounted_mb={:.2} rss_mb={}",
+        event,
+        partition_id,
+        docs,
+        tokens,
+        tracked_memory_bytes as f64 / 1024.0 / 1024.0,
+        token_set_bytes as f64 / 1024.0 / 1024.0,
+        doc_set_bytes as f64 / 1024.0 / 1024.0,
+        posting_lists_overhead_bytes as f64 / 1024.0 / 1024.0,
+        posting_lists_payload_bytes as f64 / 1024.0 / 1024.0,
+        unaccounted_bytes as f64 / 1024.0 / 1024.0,
+        rss_mb,
+    );
+}
 
 #[derive(Debug)]
 pub struct InvertedIndexBuilder {
@@ -168,6 +248,12 @@ impl InvertedIndexBuilder {
         let num_workers = *LANCE_FTS_NUM_SHARDS;
         let tokenizer = self.params.build()?;
         let with_position = self.params.with_position;
+        let target_partition_size_bytes = *LANCE_FTS_TARGET_SIZE << 20;
+        let worker_memory_limit_bytes = self
+            .params
+            .worker_memory_limit_mb
+            .unwrap_or(*LANCE_FTS_PARTITION_SIZE)
+            << 20;
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
         let id_alloc = Arc::new(AtomicU64::new(next_id));
         let tokenized_count = Arc::new(AtomicU64::new(0));
@@ -190,6 +276,8 @@ impl InvertedIndexBuilder {
                     id_alloc,
                     fragment_mask,
                     token_set_format,
+                    target_partition_size_bytes,
+                    worker_memory_limit_bytes,
                 )
                 .await?;
                 while let Ok(batch) = receiver.recv().await {
@@ -354,84 +442,50 @@ impl InvertedIndexBuilder {
     }
 
     async fn write(&self, dest_store: &dyn IndexStore) -> Result<()> {
-        if self.params.skip_merge {
-            let mut partitions =
-                Vec::with_capacity(self.partitions.len() + self.new_partitions.len());
-            partitions.extend_from_slice(&self.partitions);
-            partitions.extend_from_slice(&self.new_partitions);
-            partitions.sort_unstable();
+        let mut partitions = Vec::with_capacity(self.partitions.len() + self.new_partitions.len());
+        partitions.extend_from_slice(&self.partitions);
+        partitions.extend_from_slice(&self.new_partitions);
+        partitions.sort_unstable();
 
-            self.progress
-                .stage_start(
-                    "copy_partitions",
-                    Some(partitions.len() as u64),
-                    "partitions",
-                )
-                .await?;
-            let mut copied = 0;
-            for part in self.partitions.iter() {
-                self.src_store
-                    .copy_index_file(&token_file_path(*part), dest_store)
-                    .await?;
-                self.src_store
-                    .copy_index_file(&posting_file_path(*part), dest_store)
-                    .await?;
-                self.src_store
-                    .copy_index_file(&doc_file_path(*part), dest_store)
-                    .await?;
-                copied += 1;
-                self.progress
-                    .stage_progress("copy_partitions", copied)
-                    .await?;
-            }
-            for part in self.new_partitions.iter() {
-                self.local_store
-                    .copy_index_file(&token_file_path(*part), dest_store)
-                    .await?;
-                self.local_store
-                    .copy_index_file(&posting_file_path(*part), dest_store)
-                    .await?;
-                self.local_store
-                    .copy_index_file(&doc_file_path(*part), dest_store)
-                    .await?;
-                copied += 1;
-                self.progress
-                    .stage_progress("copy_partitions", copied)
-                    .await?;
-            }
-            self.progress.stage_complete("copy_partitions").await?;
-
-            self.write_metadata_with_progress(dest_store, &partitions)
-                .await?;
-            return Ok(());
-        }
-
-        let partitions = self
-            .partitions
-            .iter()
-            .map(|part| PartitionSource::new(self.src_store.clone(), *part))
-            .chain(
-                self.new_partitions
-                    .iter()
-                    .map(|part| PartitionSource::new(self.local_store.clone(), *part)),
-            )
-            .collect::<Vec<_>>();
         self.progress
             .stage_start(
-                "merge_partitions",
+                "copy_partitions",
                 Some(partitions.len() as u64),
                 "partitions",
             )
             .await?;
-        let mut merger = SizeBasedMerger::new(
-            dest_store,
-            partitions,
-            *LANCE_FTS_TARGET_SIZE << 20,
-            self.token_set_format,
-            self.progress.clone(),
-        );
-        let partitions = merger.merge().await?;
-        self.progress.stage_complete("merge_partitions").await?;
+        let mut copied = 0;
+        for part in self.partitions.iter() {
+            self.src_store
+                .copy_index_file(&token_file_path(*part), dest_store)
+                .await?;
+            self.src_store
+                .copy_index_file(&posting_file_path(*part), dest_store)
+                .await?;
+            self.src_store
+                .copy_index_file(&doc_file_path(*part), dest_store)
+                .await?;
+            copied += 1;
+            self.progress
+                .stage_progress("copy_partitions", copied)
+                .await?;
+        }
+        for part in self.new_partitions.iter() {
+            self.local_store
+                .copy_index_file(&token_file_path(*part), dest_store)
+                .await?;
+            self.local_store
+                .copy_index_file(&posting_file_path(*part), dest_store)
+                .await?;
+            self.local_store
+                .copy_index_file(&doc_file_path(*part), dest_store)
+                .await?;
+            copied += 1;
+            self.progress
+                .stage_progress("copy_partitions", copied)
+                .await?;
+        }
+        self.progress.stage_complete("copy_partitions").await?;
 
         self.write_metadata_with_progress(dest_store, &partitions)
             .await?;
@@ -546,12 +600,12 @@ impl InnerBuilder {
         let schema = inverted_list_schema(self.with_position);
         let docs_for_batches = docs.clone();
         let schema_for_batches = schema.clone();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = async_channel::bounded(*LANCE_FTS_WRITE_QUEUE_SIZE);
         let producer = spawn_cpu(move || {
             for posting_list in posting_lists {
                 let batch = posting_list
                     .to_batch_with_docs(&docs_for_batches, schema_for_batches.clone())?;
-                if let Err(err) = tx.send(batch) {
+                if let Err(err) = tx.send_blocking(batch) {
                     return Err(Error::execution(format!(
                         "failed to send posting list batch to writer: {err}"
                     )));
@@ -562,7 +616,7 @@ impl InnerBuilder {
 
         let mut write_duration = std::time::Duration::ZERO;
         let mut num_posting_lists = 0;
-        while let Some(batch) = rx.recv().await {
+        while let Ok(batch) = rx.recv().await {
             num_posting_lists += 1;
             let start = std::time::Instant::now();
             if let Err(err) = writer.write_record_batch(batch).await {
@@ -622,7 +676,9 @@ struct IndexWorker {
     builder: InnerBuilder,
     partitions: Vec<u64>,
     schema: SchemaRef,
-    estimated_size: u64,
+    memory_size: u64,
+    target_partition_size_bytes: u64,
+    worker_memory_limit_bytes: u64,
     total_doc_length: usize,
     fragment_mask: Option<u64>,
     token_set_format: TokenSetFormat,
@@ -633,6 +689,30 @@ struct IndexWorker {
 }
 
 impl IndexWorker {
+    fn posting_lists_overhead_size(&self) -> u64 {
+        (self.builder.posting_lists.capacity() * std::mem::size_of::<PostingListBuilder>()) as u64
+    }
+
+    fn adjust_tracked_value(tracked: &mut u64, old: u64, new: u64) {
+        if new >= old {
+            *tracked += new - old;
+        } else {
+            *tracked -= old - new;
+        }
+    }
+
+    fn adjust_tracked_memory_size(&mut self, old_memory_size: u64, new_memory_size: u64) {
+        Self::adjust_tracked_value(&mut self.memory_size, old_memory_size, new_memory_size);
+    }
+
+    fn apply_delta(total: &mut u64, delta: i64) {
+        if delta >= 0 {
+            *total += delta as u64;
+        } else {
+            *total -= (-delta) as u64;
+        }
+    }
+
     async fn new(
         store: Arc<dyn IndexStore>,
         tokenizer: Box<dyn LanceTokenizer>,
@@ -640,6 +720,8 @@ impl IndexWorker {
         id_alloc: Arc<AtomicU64>,
         fragment_mask: Option<u64>,
         token_set_format: TokenSetFormat,
+        target_partition_size_bytes: u64,
+        worker_memory_limit_bytes: u64,
     ) -> Result<Self> {
         let schema = inverted_list_schema(with_position);
 
@@ -655,7 +737,9 @@ impl IndexWorker {
             partitions: Vec::new(),
             id_alloc,
             schema,
-            estimated_size: 0,
+            memory_size: 0,
+            target_partition_size_bytes,
+            worker_memory_limit_bytes,
             total_doc_length: 0,
             fragment_mask,
             token_set_format,
@@ -680,6 +764,8 @@ impl IndexWorker {
 
         let with_position = self.has_position();
         for (doc, row_id) in docs {
+            let builder_was_empty = self.builder.docs.is_empty();
+            let old_token_memory_size = self.builder.tokens.memory_size() as u64;
             let mut token_num: u32 = 0;
             if with_position {
                 if self.token_occurrences.capacity() < self.last_unique_token_count {
@@ -715,27 +801,53 @@ impl IndexWorker {
                     token_num += 1;
                 }
             }
+            self.adjust_tracked_memory_size(
+                old_token_memory_size,
+                self.builder.tokens.memory_size() as u64,
+            );
+
+            let old_posting_lists_overhead_size = self.posting_lists_overhead_size();
             self.builder
                 .posting_lists
                 .resize_with(self.builder.tokens.len(), || {
                     PostingListBuilder::new(with_position)
                 });
+            let new_posting_lists_overhead_size = self.posting_lists_overhead_size();
+            Self::adjust_tracked_value(
+                &mut self.memory_size,
+                old_posting_lists_overhead_size,
+                new_posting_lists_overhead_size,
+            );
+
+            let old_doc_memory_size = self.builder.docs.memory_size() as u64;
             let doc_id = self.builder.docs.append(row_id, token_num);
+            self.adjust_tracked_memory_size(
+                old_doc_memory_size,
+                self.builder.docs.memory_size() as u64,
+            );
             self.total_doc_length += doc.len();
 
             if with_position {
-                let unique_tokens = self.token_occurrences.len();
-                for (token_id, term_positions) in self.token_occurrences.drain() {
-                    let posting_list = &mut self.builder.posting_lists[token_id as usize];
-
-                    let old_size = posting_list.size();
-                    posting_list.add(doc_id, term_positions);
-                    let new_size = posting_list.size();
-                    self.estimated_size += new_size - old_size;
+                let mut token_occurrences = std::mem::take(&mut self.token_occurrences);
+                let unique_tokens = token_occurrences.len();
+                let mut posting_memory_delta = 0i64;
+                for (token_id, term_positions) in token_occurrences.drain() {
+                    let (old_posting_memory_size, new_posting_memory_size) = {
+                        let posting_list = &mut self.builder.posting_lists[token_id as usize];
+                        let old_posting_memory_size = posting_list.size();
+                        posting_list.add(doc_id, term_positions);
+                        let new_posting_memory_size = posting_list.size();
+                        (old_posting_memory_size, new_posting_memory_size)
+                    };
+                    posting_memory_delta +=
+                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
                 }
+                Self::apply_delta(&mut self.memory_size, posting_memory_delta);
+                self.token_occurrences = token_occurrences;
                 self.last_unique_token_count = unique_tokens;
             } else if token_num > 0 {
                 self.token_ids.sort_unstable();
+                let mut posting_memory_delta = 0i64;
                 let mut iter = self.token_ids.iter();
                 let mut current = *iter.next().unwrap();
                 let mut count = 1u32;
@@ -745,25 +857,42 @@ impl IndexWorker {
                         continue;
                     }
 
-                    let posting_list = &mut self.builder.posting_lists[current as usize];
-                    let old_size = posting_list.size();
-                    posting_list.add(doc_id, PositionRecorder::Count(count));
-                    let new_size = posting_list.size();
-                    self.estimated_size += new_size - old_size;
+                    let (old_posting_memory_size, new_posting_memory_size) = {
+                        let posting_list = &mut self.builder.posting_lists[current as usize];
+                        let old_posting_memory_size = posting_list.size();
+                        posting_list.add(doc_id, PositionRecorder::Count(count));
+                        let new_posting_memory_size = posting_list.size();
+                        (old_posting_memory_size, new_posting_memory_size)
+                    };
+                    posting_memory_delta +=
+                        new_posting_memory_size as i64 - old_posting_memory_size as i64;
 
                     current = token_id;
                     count = 1;
                 }
-                let posting_list = &mut self.builder.posting_lists[current as usize];
-                let old_size = posting_list.size();
-                posting_list.add(doc_id, PositionRecorder::Count(count));
-                let new_size = posting_list.size();
-                self.estimated_size += new_size - old_size;
+                let (old_posting_memory_size, new_posting_memory_size) = {
+                    let posting_list = &mut self.builder.posting_lists[current as usize];
+                    let old_posting_memory_size = posting_list.size();
+                    posting_list.add(doc_id, PositionRecorder::Count(count));
+                    let new_posting_memory_size = posting_list.size();
+                    (old_posting_memory_size, new_posting_memory_size)
+                };
+                posting_memory_delta +=
+                    new_posting_memory_size as i64 - old_posting_memory_size as i64;
+                Self::apply_delta(&mut self.memory_size, posting_memory_delta);
             }
             self.last_token_count = token_num as usize;
 
+            if self.builder.docs.len() == 1 && self.memory_size > self.worker_memory_limit_bytes {
+                return Err(Error::invalid_input(format!(
+                    "single document row_id={} exceeds worker memory limit: {} > {} bytes",
+                    row_id, self.memory_size, self.worker_memory_limit_bytes
+                )));
+            }
+
             if self.builder.docs.len() as u32 == u32::MAX
-                || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 20
+                || self.memory_size >= self.target_partition_size_bytes
+                || (!builder_was_empty && self.memory_size >= self.worker_memory_limit_bytes)
             {
                 self.flush().await?;
             }
@@ -778,11 +907,36 @@ impl IndexWorker {
             return Ok(());
         }
 
-        log::info!(
-            "flushing posting lists, estimated size: {} MiB",
-            self.estimated_size / (1024 * 1024)
+        let partition_id = self.builder.id();
+        let docs_in_partition = self.builder.docs.len();
+        let tokens_in_partition = self.builder.tokens.len();
+        let tracked_memory_bytes = self.memory_size;
+        let token_set_bytes = self.builder.tokens.memory_size() as u64;
+        let doc_set_bytes = self.builder.docs.memory_size() as u64;
+        let posting_lists_overhead_bytes = self.posting_lists_overhead_size();
+        let posting_lists_payload_bytes = self
+            .builder
+            .posting_lists
+            .iter()
+            .map(PostingListBuilder::size)
+            .sum::<u64>();
+        log_memory_debug(
+            "before_flush",
+            partition_id,
+            docs_in_partition,
+            tokens_in_partition,
+            tracked_memory_bytes,
+            token_set_bytes,
+            doc_set_bytes,
+            posting_lists_overhead_bytes,
+            posting_lists_payload_bytes,
+            current_rss_bytes(),
         );
-        self.estimated_size = 0;
+        log::info!(
+            "flushing posting lists, memory size: {} MiB",
+            self.memory_size / (1024 * 1024)
+        );
+        self.memory_size = 0;
         let with_position = self.has_position();
         let mut builder = std::mem::replace(
             &mut self.builder,
@@ -795,7 +949,34 @@ impl IndexWorker {
             ),
         );
         builder.write(self.store.as_ref()).await?;
-        self.partitions.push(builder.id());
+        log_memory_debug(
+            "after_write_before_drop",
+            partition_id,
+            docs_in_partition,
+            tokens_in_partition,
+            tracked_memory_bytes,
+            token_set_bytes,
+            doc_set_bytes,
+            posting_lists_overhead_bytes,
+            posting_lists_payload_bytes,
+            current_rss_bytes(),
+        );
+        let written_partition_id = builder.id();
+        drop(builder);
+        maybe_trim_allocator();
+        log_memory_debug(
+            "after_drop",
+            partition_id,
+            docs_in_partition,
+            tokens_in_partition,
+            tracked_memory_bytes,
+            token_set_bytes,
+            doc_set_bytes,
+            posting_lists_overhead_bytes,
+            posting_lists_payload_bytes,
+            current_rss_bytes(),
+        );
+        self.partitions.push(written_partition_id);
         Ok(())
     }
 
@@ -1447,6 +1628,8 @@ mod tests {
             id_alloc.clone(),
             None,
             token_set_format,
+            u64::MAX,
+            u64::MAX,
         )
         .await?;
         worker1
@@ -1461,6 +1644,8 @@ mod tests {
             id_alloc.clone(),
             None,
             token_set_format,
+            u64::MAX,
+            u64::MAX,
         )
         .await?;
         worker2
@@ -1696,6 +1881,68 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_builder_default_path_skips_merge_stage() -> Result<()> {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch("hello world", 0);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+
+        let progress = Arc::new(RecordingProgress::default());
+        let mut builder = InvertedIndexBuilder::new(InvertedIndexParams::default())
+            .with_progress(progress.clone());
+        builder.update(stream, store.as_ref()).await?;
+
+        let tags = progress
+            .events
+            .lock()
+            .await
+            .iter()
+            .map(|(kind, stage, _)| format!("{kind}:{stage}"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            tags.iter().any(|e| e == "start:copy_partitions"),
+            "default path should copy finalized partitions"
+        );
+        assert!(
+            !tags.iter().any(|e| e == "start:merge_partitions"),
+            "default path should not run merge_partitions"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_worker_memory_limit_rejects_single_large_doc() {
+        let index_dir = TempDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            index_dir.obj_path(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = make_doc_batch("hello world", 42);
+        let stream = RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch)]));
+        let stream = Box::pin(stream);
+
+        let mut builder =
+            InvertedIndexBuilder::new(InvertedIndexParams::default().worker_memory_limit_mb(0));
+        let err = builder
+            .update(stream, store.as_ref())
+            .await
+            .expect_err("single doc should exceed zero worker memory limit");
+        assert!(
+            err.to_string().contains("row_id=42"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]

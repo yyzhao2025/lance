@@ -94,6 +94,13 @@ pub struct InvertedIndexParams {
     /// This can be useful for distributed indexing where merge is handled separately.
     #[serde(default)]
     pub(crate) skip_merge: bool,
+
+    /// Per-worker memory limit in MiB for the build stage.
+    ///
+    /// This is a build-time tuning knob only and does not affect the persisted
+    /// index layout.
+    #[serde(default)]
+    pub(crate) worker_memory_limit_mb: Option<u64>,
 }
 
 impl TryFrom<&InvertedIndexParams> for pbold::InvertedIndexDetails {
@@ -140,6 +147,7 @@ impl TryFrom<&pbold::InvertedIndexDetails> for InvertedIndexParams {
             max_ngram_length: details.max_ngram_length,
             prefix_only: details.prefix_only,
             skip_merge: defaults.skip_merge,
+            worker_memory_limit_mb: defaults.worker_memory_limit_mb,
         })
     }
 }
@@ -192,6 +200,7 @@ impl InvertedIndexParams {
             max_ngram_length: default_max_ngram_length(),
             prefix_only: false,
             skip_merge: false,
+            worker_memory_limit_mb: None,
         }
     }
 
@@ -283,6 +292,11 @@ impl InvertedIndexParams {
     /// Skip merging partitions after indexing.
     pub fn skip_merge(mut self, skip_merge: bool) -> Self {
         self.skip_merge = skip_merge;
+        self
+    }
+
+    pub fn worker_memory_limit_mb(mut self, worker_memory_limit_mb: u64) -> Self {
+        self.worker_memory_limit_mb = Some(worker_memory_limit_mb);
         self
     }
 

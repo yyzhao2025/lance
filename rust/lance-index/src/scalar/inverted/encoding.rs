@@ -28,6 +28,7 @@ use lance_core::Result;
 
 // compress the posting list to multiple blocks of fixed number of elements (BLOCK_SIZE),
 // returns a LargeBinaryArray, where each binary is a compressed block (128 row ids + 128 frequencies)
+#[allow(dead_code)]
 pub fn compress_posting_list<'a>(
     length: usize,
     doc_ids: impl Iterator<Item = &'a u32>,
@@ -90,6 +91,53 @@ pub fn compress_posting_list<'a>(
     Ok(builder.finish())
 }
 
+#[allow(dead_code)]
+pub(crate) fn encode_full_posting_block(doc_ids: &[u32], frequencies: &[u32]) -> Result<Vec<u8>> {
+    debug_assert_eq!(doc_ids.len(), BLOCK_SIZE);
+    debug_assert_eq!(frequencies.len(), BLOCK_SIZE);
+    let mut block = Vec::with_capacity(BLOCK_SIZE * 3 + 6);
+    encode_full_posting_block_into(doc_ids, frequencies, &mut block)?;
+    Ok(block)
+}
+
+pub(crate) fn encode_full_posting_block_into(
+    doc_ids: &[u32],
+    frequencies: &[u32],
+    block: &mut Vec<u8>,
+) -> Result<()> {
+    debug_assert_eq!(doc_ids.len(), BLOCK_SIZE);
+    debug_assert_eq!(frequencies.len(), BLOCK_SIZE);
+    block.extend_from_slice(&0f32.to_le_bytes());
+    let mut buffer = [0u8; BLOCK_SIZE * 4 + 5];
+    compress_sorted_block(doc_ids, &mut buffer, block)?;
+    compress_block(frequencies, &mut buffer, block)?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn encode_remainder_posting_block(
+    doc_ids: &[u32],
+    frequencies: &[u32],
+) -> Result<Vec<u8>> {
+    debug_assert_eq!(doc_ids.len(), frequencies.len());
+    let mut block = Vec::with_capacity(4 + doc_ids.len() * 8);
+    encode_remainder_posting_block_into(doc_ids, frequencies, &mut block)?;
+    Ok(block)
+}
+
+pub(crate) fn encode_remainder_posting_block_into(
+    doc_ids: &[u32],
+    frequencies: &[u32],
+    block: &mut Vec<u8>,
+) -> Result<()> {
+    debug_assert_eq!(doc_ids.len(), frequencies.len());
+    block.extend_from_slice(&0f32.to_le_bytes());
+    compress_remainder(doc_ids, block)?;
+    compress_remainder(frequencies, block)?;
+    Ok(())
+}
+
+#[allow(dead_code)]
 pub fn compress_posting_list_with_scores<'a, F>(
     length: usize,
     doc_ids: impl Iterator<Item = &'a u32>,
@@ -174,11 +222,7 @@ where
 }
 
 #[inline]
-fn compress_sorted_block(
-    data: &[u32],
-    buffer: &mut [u8],
-    builder: &mut LargeBinaryBuilder,
-) -> Result<()> {
+fn compress_sorted_block(data: &[u32], buffer: &mut [u8], builder: &mut impl Write) -> Result<()> {
     let compressor = BitPacker4x::new();
     let num_bits = compressor.num_bits_sorted(data[0], data);
     let num_bytes = compressor.compress_sorted(data[0], data, buffer, num_bits);
@@ -189,7 +233,7 @@ fn compress_sorted_block(
 }
 
 #[inline]
-fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuilder) -> Result<()> {
+fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut impl Write) -> Result<()> {
     let compressor = BitPacker4x::new();
     let num_bits = compressor.num_bits(data);
     let num_bytes = compressor.compress(data, buffer, num_bits);
@@ -199,7 +243,7 @@ fn compress_block(data: &[u32], buffer: &mut [u8], builder: &mut LargeBinaryBuil
 }
 
 #[inline]
-fn compress_remainder(data: &[u32], builder: &mut LargeBinaryBuilder) -> Result<()> {
+fn compress_remainder(data: &[u32], builder: &mut impl Write) -> Result<()> {
     for value in data.iter() {
         let _ = builder.write(value.to_le_bytes().as_ref())?;
     }
@@ -320,6 +364,25 @@ pub fn decompress_posting_remainder(
     let block = &block[4..];
     decompress_remainder(block, n, doc_ids);
     decompress_remainder(&block[n * 4..], n, frequencies);
+}
+
+pub(crate) fn decode_full_posting_block(
+    block: &[u8],
+    doc_ids: &mut Vec<u32>,
+    frequencies: &mut Vec<u32>,
+) {
+    let mut buffer = [0u32; BLOCK_SIZE];
+    decompress_posting_block(block, &mut buffer, doc_ids, frequencies);
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_posting_remainder(
+    block: &[u8],
+    len: usize,
+    doc_ids: &mut Vec<u32>,
+    frequencies: &mut Vec<u32>,
+) {
+    decompress_posting_remainder(block, len, doc_ids, frequencies);
 }
 
 pub fn decompress_sorted_block(

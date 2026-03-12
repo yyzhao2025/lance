@@ -46,6 +46,7 @@ lance-geo = { workspace = true, optional = true }
 lance-io.workspace = true
 lance-linalg.workspace = true
 lance-table.workspace = true
+libc.workspace = true
 libm.workspace = true
 log.workspace = true
 ndarray.workspace = true

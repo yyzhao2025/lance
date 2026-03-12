@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+#![allow(dead_code)]
+
 use fst::Streamer;
 use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result, cache::LanceCache, utils::tokio::get_num_compute_intensive_cpus};

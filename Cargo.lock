@@ -5130,6 +5130,7 @@ dependencies = [
  "lance-linalg",
  "lance-table",
  "lance-testing",
+ "libc",
  "libm",
  "lindera",
  "lindera-tantivy",
