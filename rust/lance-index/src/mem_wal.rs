@@ -3,12 +3,15 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::io::Cursor;
 use std::sync::Arc;
 
+use arrow_array::{Array, RecordBatch};
 use async_trait::async_trait;
 use deepsize::DeepSizeOf;
 use lance_core::Error;
 use lance_table::format::pb;
+use murmur3::murmur3_32;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -272,6 +275,275 @@ impl From<pb::RegionSpec> for RegionSpec {
     }
 }
 
+/// Well-known transform types for region bucket transforms.
+pub mod transforms {
+    /// Identity transform - uses the value as-is.
+    pub const IDENTITY: &str = "identity";
+    /// Bucket transform - hashes the value into N buckets.
+    pub const BUCKET: &str = "bucket";
+    /// Multi-bucket transform - same as bucket but multiple fields.
+    pub const MULTI_BUCKET: &str = "multi_bucket";
+}
+
+/// Bucket transform result containing the bucket number and region values.
+#[derive(Debug, Clone)]
+pub struct BucketResult {
+    /// The computed bucket number (0 to num_buckets-1).
+    pub bucket: u32,
+    /// The number of buckets in the transform.
+    pub num_buckets: u32,
+}
+
+impl RegionField {
+    /// Compute the value of this region field for a single row.
+    /// Returns the raw bytes representing the hashed or transformed value.
+    pub fn compute_value(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> lance_core::Result<Vec<u8>> {
+        match self.transform.as_deref() {
+            Some(transforms::BUCKET) | Some(transforms::MULTI_BUCKET) => {
+                self.compute_bucket_value(batch, row_idx)
+            }
+            Some(transforms::IDENTITY) | None => self.compute_identity_value(batch, row_idx),
+            Some(transform) => Err(Error::not_supported_source(
+                format!("Unsupported region transform: {}", transform).into(),
+            )),
+        }
+    }
+
+    /// Compute the bucket value for bucket/multi_bucket transforms.
+    fn compute_bucket_value(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> lance_core::Result<Vec<u8>> {
+        let num_buckets: u32 = self
+            .parameters
+            .get("num_buckets")
+            .ok_or_else(|| Error::invalid_input("bucket transform requires num_buckets"))?
+            .parse()
+            .map_err(|e| Error::invalid_input(format!("Invalid num_buckets: {}", e)))?;
+
+        let hash = self.compute_murmur3_hash(batch, row_idx)?;
+        let bucket = (hash.unsigned_abs()) % num_buckets;
+        Ok(bucket.to_le_bytes().to_vec())
+    }
+
+    /// Compute the identity value (raw column values concatenated).
+    fn compute_identity_value(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> lance_core::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        for &field_id in &self.source_ids {
+            let col_idx = find_column_by_field_id(batch, field_id)?;
+            let col = batch.column(col_idx);
+            append_array_value(&mut data, col.as_ref(), row_idx)?;
+        }
+        Ok(data)
+    }
+
+    /// Compute the murmur3 hash for the source columns at a specific row.
+    fn compute_murmur3_hash(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> lance_core::Result<i32> {
+        let mut data = Vec::new();
+        for &field_id in &self.source_ids {
+            let col_idx = find_column_by_field_id(batch, field_id)?;
+            let col = batch.column(col_idx);
+            append_array_value(&mut data, col.as_ref(), row_idx)?;
+        }
+
+        let hash = murmur3_32(&mut Cursor::new(&data), 0)
+            .map_err(|e| Error::internal(format!("murmur3 hash failed: {}", e)))?;
+        Ok(hash as i32)
+    }
+}
+
+impl RegionSpec {
+    /// Compute the bucket for a given row based on the region spec fields.
+    ///
+    /// This method assumes the first field in the spec defines the bucket transform.
+    /// For multi-field bucket specs, all field hashes are combined.
+    ///
+    /// # Arguments
+    ///
+    /// * `batch` - The RecordBatch containing the row data
+    /// * `row_idx` - The index of the row to compute the bucket for
+    ///
+    /// # Returns
+    ///
+    /// A `BucketResult` containing the bucket number and total bucket count.
+    pub fn compute_bucket(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> lance_core::Result<BucketResult> {
+        let field = self
+            .fields
+            .first()
+            .ok_or_else(|| Error::invalid_input("Region spec has no fields"))?;
+
+        match field.transform.as_deref() {
+            Some(transforms::BUCKET) | Some(transforms::MULTI_BUCKET) => {
+                let num_buckets: u32 = field
+                    .parameters
+                    .get("num_buckets")
+                    .ok_or_else(|| Error::invalid_input("bucket transform requires num_buckets"))?
+                    .parse()
+                    .map_err(|e| Error::invalid_input(format!("Invalid num_buckets: {}", e)))?;
+
+                let hash = field.compute_murmur3_hash(batch, row_idx)?;
+                let bucket = (hash.unsigned_abs()) % num_buckets;
+
+                Ok(BucketResult {
+                    bucket,
+                    num_buckets,
+                })
+            }
+            _ => Err(Error::not_supported_source(
+                "Only bucket/multi_bucket transforms are currently supported for routing".into(),
+            )),
+        }
+    }
+
+    /// Compute buckets for all rows in a batch.
+    ///
+    /// Returns a vector of bucket assignments, one per row.
+    pub fn compute_buckets(
+        &self,
+        batch: &RecordBatch,
+    ) -> lance_core::Result<(Vec<u32>, u32)> {
+        let field = self
+            .fields
+            .first()
+            .ok_or_else(|| Error::invalid_input("Region spec has no fields"))?;
+
+        let num_buckets: u32 = field
+            .parameters
+            .get("num_buckets")
+            .ok_or_else(|| Error::invalid_input("bucket transform requires num_buckets"))?
+            .parse()
+            .map_err(|e| Error::invalid_input(format!("Invalid num_buckets: {}", e)))?;
+
+        let buckets: Vec<u32> = (0..batch.num_rows())
+            .map(|row_idx| {
+                let hash = field.compute_murmur3_hash(batch, row_idx)?;
+                Ok((hash.unsigned_abs()) % num_buckets)
+            })
+            .collect::<lance_core::Result<_>>()?;
+
+        Ok((buckets, num_buckets))
+    }
+}
+
+/// Find the column index in a RecordBatch by field ID.
+///
+/// Field IDs are stored in schema metadata. If not found, falls back to index-based lookup.
+fn find_column_by_field_id(batch: &RecordBatch, field_id: i32) -> lance_core::Result<usize> {
+    // First, try to find by field ID in schema metadata
+    for (idx, field) in batch.schema().fields().iter().enumerate() {
+        if let Some(id_str) = field.metadata().get("field_id") {
+            if let Ok(id) = id_str.parse::<i32>() {
+                if id == field_id {
+                    return Ok(idx);
+                }
+            }
+        }
+    }
+
+    // Fallback: treat field_id as column index
+    let idx = field_id as usize;
+    if idx < batch.num_columns() {
+        Ok(idx)
+    } else {
+        Err(Error::invalid_input(format!(
+            "Field ID {} not found in batch with {} columns",
+            field_id,
+            batch.num_columns()
+        )))
+    }
+}
+
+/// Append the value of an array at a specific row index to a byte buffer.
+fn append_array_value(
+    buffer: &mut Vec<u8>,
+    array: &dyn Array,
+    row_idx: usize,
+) -> lance_core::Result<()> {
+    use arrow_array::{
+        BinaryArray, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+        Int8Array, LargeBinaryArray, LargeStringArray, StringArray, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array,
+    };
+
+    if array.is_null(row_idx) {
+        // For null values, append a null marker
+        buffer.push(0);
+        return Ok(());
+    }
+
+    // Non-null marker
+    buffer.push(1);
+
+    // Type-specific value extraction
+    // We use a simple approach: convert to bytes and append
+    if let Some(arr) = array.as_any().downcast_ref::<Int8Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<Int16Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<Int32Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<UInt8Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<UInt16Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<UInt32Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<Float32Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
+        buffer.extend_from_slice(&arr.value(row_idx).to_le_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
+        buffer.push(if arr.value(row_idx) { 1 } else { 0 });
+    } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
+        let val = arr.value(row_idx);
+        buffer.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(val.as_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<LargeStringArray>() {
+        let val = arr.value(row_idx);
+        buffer.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        buffer.extend_from_slice(val.as_bytes());
+    } else if let Some(arr) = array.as_any().downcast_ref::<BinaryArray>() {
+        let val = arr.value(row_idx);
+        buffer.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        buffer.extend_from_slice(val);
+    } else if let Some(arr) = array.as_any().downcast_ref::<LargeBinaryArray>() {
+        let val = arr.value(row_idx);
+        buffer.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        buffer.extend_from_slice(val);
+    } else {
+        return Err(Error::not_supported_source(
+            format!(
+                "Unsupported array type for bucket hashing: {:?}",
+                array.data_type()
+            )
+            .into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Index details for MemWAL Index, stored in IndexMetadata.index_details.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, DeepSizeOf)]
 pub struct MemWalIndexDetails {
@@ -421,5 +693,175 @@ impl Index for MemWalIndex {
 
     async fn calculate_included_frags(&self) -> lance_core::Result<RoaringBitmap> {
         Ok(RoaringBitmap::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, Int64Array, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn make_test_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+
+        let id_array = Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let name_array = StringArray::from(vec![
+            "alice", "bob", "charlie", "david", "eve", "frank", "grace", "henry", "ivy", "jack",
+        ]);
+        let value_array = Int32Array::from(vec![100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]);
+
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(id_array),
+                Arc::new(name_array),
+                Arc::new(value_array),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn make_bucket_region_spec(source_id: i32, num_buckets: u32) -> RegionSpec {
+        let mut parameters = HashMap::new();
+        parameters.insert("num_buckets".to_string(), num_buckets.to_string());
+
+        RegionSpec {
+            spec_id: 1,
+            fields: vec![RegionField {
+                field_id: "bucket_field".to_string(),
+                source_ids: vec![source_id],
+                transform: Some(transforms::BUCKET.to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_compute_bucket_single_field() {
+        let batch = make_test_batch();
+        let spec = make_bucket_region_spec(0, 4); // Use column 0 (id), 4 buckets
+
+        for row_idx in 0..batch.num_rows() {
+            let result = spec.compute_bucket(&batch, row_idx).unwrap();
+            assert!(result.bucket < 4, "Bucket should be in range [0, 4)");
+            assert_eq!(result.num_buckets, 4);
+        }
+    }
+
+    #[test]
+    fn test_compute_buckets_batch() {
+        let batch = make_test_batch();
+        let spec = make_bucket_region_spec(0, 4);
+
+        let (buckets, num_buckets) = spec.compute_buckets(&batch).unwrap();
+
+        assert_eq!(buckets.len(), batch.num_rows());
+        assert_eq!(num_buckets, 4);
+
+        for &bucket in &buckets {
+            assert!(bucket < 4, "All buckets should be in range [0, 4)");
+        }
+    }
+
+    #[test]
+    fn test_compute_bucket_string_field() {
+        let batch = make_test_batch();
+        let spec = make_bucket_region_spec(1, 8); // Use column 1 (name), 8 buckets
+
+        let (buckets, num_buckets) = spec.compute_buckets(&batch).unwrap();
+
+        assert_eq!(buckets.len(), batch.num_rows());
+        assert_eq!(num_buckets, 8);
+
+        for &bucket in &buckets {
+            assert!(bucket < 8, "All buckets should be in range [0, 8)");
+        }
+    }
+
+    #[test]
+    fn test_compute_bucket_deterministic() {
+        let batch = make_test_batch();
+        let spec = make_bucket_region_spec(0, 16);
+
+        let (buckets1, _) = spec.compute_buckets(&batch).unwrap();
+        let (buckets2, _) = spec.compute_buckets(&batch).unwrap();
+
+        assert_eq!(buckets1, buckets2, "Bucket assignments should be deterministic");
+    }
+
+    #[test]
+    fn test_unsupported_transform() {
+        let spec = RegionSpec {
+            spec_id: 1,
+            fields: vec![RegionField {
+                field_id: "unknown_field".to_string(),
+                source_ids: vec![0],
+                transform: Some("year".to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: HashMap::new(),
+            }],
+        };
+
+        let batch = make_test_batch();
+        let result = spec.compute_bucket(&batch, 0);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_missing_num_buckets() {
+        let spec = RegionSpec {
+            spec_id: 1,
+            fields: vec![RegionField {
+                field_id: "bucket_field".to_string(),
+                source_ids: vec![0],
+                transform: Some(transforms::BUCKET.to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters: HashMap::new(), // Missing num_buckets
+            }],
+        };
+
+        let batch = make_test_batch();
+        let result = spec.compute_bucket(&batch, 0);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multi_column_bucket() {
+        let mut parameters = HashMap::new();
+        parameters.insert("num_buckets".to_string(), "4".to_string());
+
+        let spec = RegionSpec {
+            spec_id: 1,
+            fields: vec![RegionField {
+                field_id: "multi_bucket".to_string(),
+                source_ids: vec![0, 2], // id and value columns
+                transform: Some(transforms::MULTI_BUCKET.to_string()),
+                expression: None,
+                result_type: "int32".to_string(),
+                parameters,
+            }],
+        };
+
+        let batch = make_test_batch();
+        let (buckets, num_buckets) = spec.compute_buckets(&batch).unwrap();
+
+        assert_eq!(buckets.len(), batch.num_rows());
+        assert_eq!(num_buckets, 4);
+
+        for &bucket in &buckets {
+            assert!(bucket < 4);
+        }
     }
 }
