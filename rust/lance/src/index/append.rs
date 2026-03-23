@@ -286,7 +286,13 @@ pub async fn merge_indices_with_unindexed_frags<'a>(
                     .map(|new_uuid| {
                         let dataset = dataset.clone();
                         let index_details = index_details.clone();
+                        // Multi-segment indices are still one logical index, so all committed
+                        // outputs intentionally keep the same name/field metadata as the source.
                         let template = old_indices[0].clone();
+                        // Current optimize_vector_indices implementations still produce a single
+                        // replacement output, so reusing the merged coverage bitmap is correct.
+                        // When vector optimize starts emitting multiple physical outputs, each
+                        // output must carry its own fragment coverage instead of cloning this.
                         let fragment_bitmap = frag_bitmap.clone();
                         async move {
                             let index_dir = dataset.indices_dir().child(new_uuid.to_string());
