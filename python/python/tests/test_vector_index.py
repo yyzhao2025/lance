@@ -2734,6 +2734,7 @@ def test_index_segment_builder_builds_vector_segments(tmp_path):
         )
         for fragment in frags[:2]
     ]
+    assert all(segment.index_details is not None for segment in segments)
 
     segment_builder = ds.create_index_segment_builder().with_segments(segments)
     plans = segment_builder.plan()

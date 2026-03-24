@@ -4427,6 +4427,7 @@ class Index:
     created_at: Optional[datetime] = None
     base_id: Optional[int] = None
     files: Optional[List["IndexFile"]] = None
+    index_details: Optional[tuple[str, bytes]] = None
 
 
 class AutoCleanupConfig(TypedDict):
