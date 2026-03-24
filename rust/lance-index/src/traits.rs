@@ -149,13 +149,16 @@ pub trait DatasetIndexExt {
     ) -> Self::IndexBuilder<'a>;
 
     /// Create a builder for building physical index segments from uncommitted
-    /// vector index outputs.
+    /// index outputs.
     ///
     /// The caller supplies the uncommitted index metadata returned by
     /// `execute_uncommitted()` so the builder can plan segment grouping without
     /// rediscovering fragment coverage.
     ///
-    /// This is the canonical entry point for distributed vector segment build.
+    /// This is the canonical entry point for segment build before commit.
+    /// Single-input plans are supported for all index types. Multi-input
+    /// segment merge remains index-specific.
+    ///
     /// After building the physical segments, publish them as a
     /// logical index with [`Self::commit_existing_index_segments`].
     fn create_index_segment_builder<'a>(&'a self) -> Self::IndexSegmentBuilder<'a>;
@@ -209,10 +212,10 @@ pub trait DatasetIndexExt {
     /// The cache is invalidated when the dataset version (Manifest) is changed.
     async fn load_indices(&self) -> Result<Arc<Vec<IndexMetadata>>>;
 
-    /// Loads all the indies of a given UUID.
+    /// Loads the index metadata for a given UUID.
     ///
-    /// Note that it is possible to have multiple indices with the same UUID,
-    /// as they are the deltas of the same index.
+    /// Older maintenance paths may have produced multiple metadata entries that
+    /// share the same UUID, so this returns the first matching entry.
     async fn load_index(&self, uuid: &str) -> Result<Option<IndexMetadata>> {
         self.load_indices().await.map(|indices| {
             indices

@@ -1329,10 +1329,10 @@ pub trait DatasetIndexInternalExt: DatasetIndexExt {
     /// Loads information about all the available scalar indices on the dataset
     async fn scalar_index_info(&self) -> Result<ScalarIndexInfo>;
 
-    /// Return the fragments that are not covered by any of the deltas of the index.
+    /// Return the fragments that are not covered by any committed segment of the index.
     async fn unindexed_fragments(&self, idx_name: &str) -> Result<Vec<Fragment>>;
 
-    /// Return the fragments that are covered by each of the deltas of the index.
+    /// Return the fragments covered by each committed segment of the index.
     async fn indexed_fragments(&self, idx_name: &str) -> Result<Vec<Vec<Fragment>>>;
 
     /// Initialize a specific index on this dataset based on an index from a source dataset.

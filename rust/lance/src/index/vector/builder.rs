@@ -749,8 +749,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
-        // if no partitions to split, we just create a new delta index,
-        // otherwise, we need to merge all existing indices and split large partitions.
+        // If no partitions need adjustment, append one more segment.
+        // Otherwise, merge the existing segments and rebalance large partitions.
         let reader = reader.clone();
         let num_indices_to_merge = self
             .optimize_options
@@ -787,7 +787,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             match Self::check_partition_adjustment(ivf, reader.as_ref(), &self.existing_indices)? {
                 Some(partition_adjustment) => match partition_adjustment {
                     PartitionAdjustment::Split(partition) => {
-                        // Perform split and record the fact for downstream build/merge
+                        // Perform the split and record it for downstream build / merge.
                         log::info!(
                             "split partition {}, will merge all {} delta indices",
                             partition,
@@ -1828,9 +1828,10 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut row_ids = Vec::new();
         for index in self.existing_indices.iter() {
             if part_idx >= index.ivf_model().num_partitions() {
-                // there was a bug that may cause delta indices have different number of partitions,
-                // it's safe to skip loading the extra partition, and split/join the existing partitions,
-                // split/join would merge all delta indices into one so it would fix the issue
+                // Older segments could end up with inconsistent partition
+                // counts due to a historical bug. It is safe to skip the
+                // missing partition here and let split / join consolidate the
+                // existing segments back into one consistent segment.
                 // see https://github.com/lance-format/lance/issues/5312
                 log::warn!(
                     "partition index is {} but the number of partitions is {}, skip loading it",

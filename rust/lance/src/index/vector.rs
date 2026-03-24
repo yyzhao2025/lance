@@ -947,8 +947,10 @@ pub(crate) async fn build_vector_index(
     Ok(())
 }
 
-/// Build a Vector Index incrementally using an existing index's IVF model and quantizer
-/// This creates a delta index that shares centroids with the source index
+/// Build a vector index incrementally using an existing index's IVF model and quantizer.
+///
+/// The new index reuses the source centroids and quantizer so the appended
+/// segment stays compatible with the existing IVF layout.
 #[instrument(level = "debug", skip(dataset, existing_index, frag_reuse_index))]
 pub(crate) async fn build_vector_index_incremental(
     dataset: &Dataset,
@@ -1440,10 +1442,11 @@ pub(crate) async fn open_vector_index_v2(
     Ok(index)
 }
 
-/// Initialize a vector index from a source dataset
-/// This will reuse the centroids from the source dataset,
-/// making the new indices basically a "delta index" of the source dataset,
-/// until the new dataset fully retains the index.
+/// Initialize a vector index from a source dataset.
+///
+/// This reuses the centroids from the source dataset so the initialized index
+/// starts from the same IVF layout and can be retained independently by the
+/// target dataset over time.
 pub async fn initialize_vector_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
@@ -1586,7 +1589,7 @@ pub async fn initialize_vector_index(
     Ok(())
 }
 
-/// Create IVF build parameters for delta index creation from an existing IVF model
+/// Create IVF build parameters for incremental index creation from an existing IVF model.
 /// TODO: support deriving all the original parameters
 fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
     IvfBuildParams {
@@ -1820,7 +1823,8 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same (key verification for delta indices)
+        // Verify the centroids are exactly the same, which keeps appended index
+        // entries compatible with the retained IVF layout.
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -2039,7 +2043,8 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same (key verification for delta indices)
+        // Verify the centroids are exactly the same, which keeps appended index
+        // entries compatible with the retained IVF layout.
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -2727,7 +2732,8 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same (key verification for delta indices)
+        // Verify the centroids are exactly the same, which keeps appended index
+        // entries compatible with the retained IVF layout.
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -2949,7 +2955,8 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same (key verification for delta indices)
+        // Verify the centroids are exactly the same, which keeps appended index
+        // entries compatible with the retained IVF layout.
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -3219,7 +3226,8 @@ mod tests {
             "SQ should use 8 bits"
         );
 
-        // Verify the centroids are exactly the same (key verification for delta indices)
+        // Verify the centroids are exactly the same, which keeps appended index
+        // entries compatible with the retained IVF layout.
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {

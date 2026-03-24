@@ -77,7 +77,7 @@ impl IndexSegment {
 }
 
 /// A plan for building one physical segment from one or more existing
-/// vector index segments.
+/// source segments.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSegmentPlan {
     segment: IndexSegment,

@@ -3531,7 +3531,7 @@ mod tests {
     async fn test_spfresh_join_split() {
         // Two join cycles followed by three append cycles:
         // 1. Each deletion shrinks the smallest partition and verifies the partition count.
-        // 2. Append #1 (10k rows) creates a delta index without splitting.
+        // 2. Append #1 (10k rows) creates one additional segment without splitting.
         // 3. Append #2 and #3 (40k rows each) trigger splits, forcing merges and validating partition sizes.
 
         const INDEX_NAME: &str = "vector_idx";
@@ -3653,7 +3653,7 @@ mod tests {
             expected_partitions = actual_partitions;
         }
 
-        // Append #1: no split, expect a delta index.
+        // Append #1: no split, expect one additional segment.
         let rows = FIRST_APPEND_ROWS;
         append_and_verify_append_phase(
             &mut dataset,
@@ -4049,7 +4049,7 @@ mod tests {
         // Reset IO stats after index creation
         dataset.object_store().io_stats_incremental();
 
-        // Prewarm should perform IO to load all index deltas into cache
+        // Prewarm should perform IO to load all retained segments into cache.
         dataset.prewarm_index(INDEX_NAME).await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert!(
@@ -4057,7 +4057,7 @@ mod tests {
             "prewarm should have read from disk, but read_iops was 0"
         );
 
-        // Query should not perform IO after prewarm of all deltas
+        // Query should not perform IO after prewarm of all retained segments.
         let q = Float32Array::from(template_values.clone());
         dataset
             .scan()

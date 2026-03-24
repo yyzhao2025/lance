@@ -18,9 +18,10 @@ write:
 3. Lance plans and builds index artifacts from the worker outputs supplied by the caller
 4. the built artifacts are committed into the dataset manifest
 
-For vector indices, the worker outputs are segments stored directly
-under `indices/<segment_uuid>/`. Lance can turn these outputs into one or more
-physical segments and then commit them as one logical index.
+The underlying build model is segment-based: workers produce uncommitted
+segments, Lance finalizes those segments into one or more physical segments,
+and the caller commits them as one logical index.
+Today, the multi-input segment-finalize path is implemented for vector indices.
 
 ![Distributed Vector Segment Build](../images/distributed_vector_segment_build.svg)
 
@@ -82,7 +83,7 @@ launching workers and driving the overall workflow.
 
 ## Current Model
 
-The current model for distributed vector indexing has two layers of parallelism.
+The current public API model has two layers of parallelism.
 
 ### Worker Build
 
@@ -113,7 +114,7 @@ After the physical segments are built, publish them with
 
 ## Internal Segmented Finalize Model
 
-Internally, Lance models distributed vector segment build as:
+Internally, Lance models distributed index finalize as:
 
 1. **plan** which input segments should become each physical segment
 2. **build** each segment from its selected input segments
@@ -156,4 +157,4 @@ Lance is responsible for:
 - committing physical segments into the manifest
 
 This split keeps distributed scheduling outside the storage engine while still
-letting Lance own the on-disk index format.
+letting Lance own the on-disk index format and segment lifecycle.

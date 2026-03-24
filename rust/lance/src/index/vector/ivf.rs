@@ -1860,7 +1860,7 @@ async fn write_ivf_hnsw_file(
     Ok(())
 }
 
-/// Distributed vector segment build uses three storage-level concepts:
+/// Vector segment finalize uses three storage-level concepts:
 ///
 /// - A **segment** is a worker output written by `execute_uncommitted()`. It
 ///   already lives at its final storage path under `indices/<segment_uuid>/`,
@@ -4025,7 +4025,7 @@ mod tests {
         // Reset IO stats after migration and sampling.
         dataset.object_store().io_stats_incremental();
 
-        // Prewarm should perform IO to load all index deltas into cache.
+        // Prewarm should perform IO to load all retained segments into cache.
         dataset.prewarm_index("vector_idx").await.unwrap();
         let stats = dataset.object_store().io_stats_incremental();
         assert!(
@@ -4033,7 +4033,7 @@ mod tests {
             "prewarm should have read from disk, but read_iops was 0"
         );
 
-        // Query should not perform index IO after prewarm of all deltas.
+        // Query should not perform index IO after prewarm of all retained segments.
         dataset
             .scan()
             .nearest("vector", &q, 10)
