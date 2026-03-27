@@ -155,7 +155,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> CacheKey for IVFPartit
 /// IVF Index.
 #[derive(Debug)]
 pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
+    /// Local display path (via `to_local_path`), used for statistics.
     uri: String,
+    /// Object-store path to the index file (forward-slash separated).
+    /// Used by `cacheable_state()` for cross-platform reconstruction.
+    index_path: String,
     uuid: String,
 
     /// Ivf model
@@ -179,6 +183,7 @@ pub struct IVFIndex<S: IvfSubIndex + 'static, Q: Quantization + 'static> {
 impl<S: IvfSubIndex, Q: Quantization> DeepSizeOf for IVFIndex<S, Q> {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
         self.uri.deep_size_of_children(context)
+            + self.index_path.deep_size_of_children(context)
             + self.ivf.deep_size_of_children(context)
             + self.sub_index_metadata.deep_size_of_children(context)
             + self.uuid.deep_size_of_children(context)
@@ -281,6 +286,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let num_partitions = ivf.num_partitions();
         Ok(Self {
             uri: to_local_path(&uri),
+            index_path: uri.to_string(),
             uuid,
             ivf,
             reader: index_reader,
@@ -298,6 +304,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_cached_state(
         uri: String,
+        index_path: String,
         uuid: String,
         ivf: IvfModel,
         reader: FileReader,
@@ -310,6 +317,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         let num_partitions = ivf.num_partitions();
         Self {
             uri,
+            index_path,
             uuid,
             ivf,
             reader,
@@ -707,7 +715,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
             .map(|b| b.to_vec());
         let (sub_index_type, quantization_type) = self.sub_index_type();
         Some(Box::new(IvfIndexState {
-            index_file_path: self.uri.clone(),
+            index_file_path: self.index_path.clone(),
             uuid: self.uuid.clone(),
             ivf: self.ivf.clone(),
             aux_ivf: self.storage.ivf().clone(),
@@ -870,6 +878,7 @@ where
 
     let index = IVFIndex::<S, Q>::from_cached_state(
         to_local_path(&index_path),
+        index_path.to_string(),
         state.uuid,
         state.ivf,
         index_reader,
