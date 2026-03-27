@@ -599,6 +599,34 @@ impl CacheStats {
     }
 }
 
+/// Writer wrapper that counts bytes written through it.
+pub struct CountingWriter<'a> {
+    inner: &'a mut dyn std::io::Write,
+    written: usize,
+}
+
+impl<'a> CountingWriter<'a> {
+    pub fn new(inner: &'a mut dyn std::io::Write) -> Self {
+        Self { inner, written: 0 }
+    }
+
+    pub fn written(&self) -> usize {
+        self.written
+    }
+}
+
+impl std::io::Write for CountingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Streaming serialization codec for cache entries.
 ///
 /// **Experimental**: the serialized format is not stable and may change

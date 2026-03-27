@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
-use lance_core::cache::{CacheCodec, read_type_tag};
+use lance_core::cache::{CacheCodec, CountingWriter, read_type_tag};
 use lance_core::{ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -143,13 +143,13 @@ impl From<DistanceType> for pb::VectorMetricType {
     }
 }
 
-/// Serializable snapshot of a vector index, suitable for disk caching.
+/// Serializable snapshot of a vector index, suitable for caching.
 ///
 /// Implementations must be cheaply reconstructable into a live
 /// [`VectorIndex`] given an ObjectStore, file metadata cache, and partition
 /// cache. The reconstruction cost should be dominated by re-opening
 /// `FileReader`s, which is cheap when the file metadata cache is warm.
-pub trait VectorIndexData: CacheCodec + DeepSizeOf + std::fmt::Debug {
+pub trait VectorIndexData: DeepSizeOf + std::fmt::Debug + Send + Sync {
     /// Downcast to `&dyn Any` for concrete type access during reconstruction.
     fn as_any(&self) -> &dyn Any;
 }
@@ -250,24 +250,17 @@ impl CacheCodec for IvfIndexState {
         let aux_ivf_pb = pb::Ivf::try_from(&self.aux_ivf)?;
         let aux_ivf_bytes = aux_ivf_pb.encode_to_vec();
 
-        let mut written = 0usize;
-        macro_rules! w {
-            ($buf:expr) => {{
-                writer
-                    .write_all($buf)
-                    .map_err(|e| lance_core::Error::io(e.to_string()))?;
-                written += $buf.len();
-            }};
-        }
-        w!(&(header_json.len() as u64).to_le_bytes());
-        w!(&header_json);
-        w!(&(ivf_bytes.len() as u64).to_le_bytes());
-        w!(&ivf_bytes);
-        w!(&(extra.len() as u64).to_le_bytes());
-        w!(extra);
-        w!(&(aux_ivf_bytes.len() as u64).to_le_bytes());
-        w!(&aux_ivf_bytes);
-        Ok(written)
+        let mut cw = CountingWriter::new(writer);
+        use std::io::Write as _;
+        cw.write_all(&(header_json.len() as u64).to_le_bytes())?;
+        cw.write_all(&header_json)?;
+        cw.write_all(&(ivf_bytes.len() as u64).to_le_bytes())?;
+        cw.write_all(&ivf_bytes)?;
+        cw.write_all(&(extra.len() as u64).to_le_bytes())?;
+        cw.write_all(extra)?;
+        cw.write_all(&(aux_ivf_bytes.len() as u64).to_le_bytes())?;
+        cw.write_all(&aux_ivf_bytes)?;
+        Ok(cw.written())
     }
 
     fn type_tag(&self) -> &'static str {

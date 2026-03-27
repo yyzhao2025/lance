@@ -28,7 +28,7 @@ use arrow_ipc::reader::FileDecoder;
 use arrow_ipc::root_as_message;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
-use lance_core::cache::CacheCodec;
+use lance_core::cache::{CacheCodec, CountingWriter};
 use lance_core::{Error, Result};
 use lance_index::vector::bq::RQRotationType;
 use lance_index::vector::bq::builder::RabitQuantizer;
@@ -109,30 +109,6 @@ fn read_json_header<T: serde::de::DeserializeOwned>(reader: &mut dyn Read) -> Re
         .read_exact(&mut header_bytes)
         .map_err(|e| Error::io(e.to_string()))?;
     serde_json::from_slice(&header_bytes).map_err(|e| Error::io(e.to_string()))
-}
-
-/// Forwards writes to an inner writer while counting total bytes written.
-struct CountingWriter<'a> {
-    inner: &'a mut dyn Write,
-    written: usize,
-}
-
-impl<'a> CountingWriter<'a> {
-    fn new(inner: &'a mut dyn Write) -> Self {
-        Self { inner, written: 0 }
-    }
-}
-
-impl Write for CountingWriter<'_> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
-        self.written += n;
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
 }
 
 /// Write `batch` as a single-batch Arrow IPC stream directly to `writer`.
@@ -400,7 +376,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ProductQuantizer> {
         stream_ipc(&codebook_to_batch(codebook)?, &mut cw)?;
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(cw.written)
+        Ok(cw.written())
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
@@ -464,7 +440,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatQuantizer> {
         stream_ipc(&self.index.to_batch()?, &mut cw)?;
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(cw.written)
+        Ok(cw.written())
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
@@ -510,7 +486,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, FlatBinQuantizer> {
         stream_ipc(&self.index.to_batch()?, &mut cw)?;
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(cw.written)
+        Ok(cw.written())
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
@@ -568,7 +544,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, ScalarQuantizer> {
         // SQ storage may contain multiple batches; stream them all in one IPC stream.
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(cw.written)
+        Ok(cw.written())
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
@@ -645,7 +621,7 @@ impl<S: IvfSubIndex> CacheCodec for PartitionEntry<S, RabitQuantizer> {
 
         stream_ipc_batches(self.storage.to_batches()?, &mut cw)?;
 
-        Ok(cw.written)
+        Ok(cw.written())
     }
 
     fn deserialize(reader: &mut dyn Read) -> Result<Self> {
