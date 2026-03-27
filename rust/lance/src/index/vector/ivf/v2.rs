@@ -394,10 +394,12 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> Index for IVFIndex<S, 
 
         sub_index_stats.append(store_stats);
         if S::name() == "FLAT" {
-            sub_index_stats.insert(
-                "index_type".to_string(),
-                Q::quantization_type().to_string().into(),
-            );
+            let qt_label = match Q::quantization_type() {
+                // FlatBin is the Hamming variant of Flat; report as "FLAT".
+                QuantizationType::FlatBin => "FLAT".to_string(),
+                other => other.to_string(),
+            };
+            sub_index_stats.insert("index_type".to_string(), qt_label.into());
         } else {
             sub_index_stats.insert("index_type".to_string(), S::name().into());
         }
