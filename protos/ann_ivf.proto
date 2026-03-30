@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright The Lance Authors
+
+syntax = "proto3";
+
+package lance.datafusion;
+
+import "table_identifier.proto";
+
+// Serialized vector query parameters.
+// Faithfully round-trips every field in lance_index::vector::Query.
+message VectorQueryProto {
+  // Query vector as Arrow IPC bytes (supports Float16, Float32, Float64, UInt8, etc.)
+  bytes key_arrow_ipc = 1;
+  string column = 2;
+  uint32 k = 3;
+  optional float lower_bound = 4;
+  optional float upper_bound = 5;
+  uint32 minimum_nprobes = 6;
+  optional uint32 maximum_nprobes = 7;
+  optional uint32 ef = 8;
+  optional uint32 refine_factor = 9;
+  // Distance metric as string ("l2", "cosine", "dot", "hamming").
+  // Absent means None (use the index's default metric).
+  optional string distance_type = 10;
+  bool use_index = 11;
+  float dist_q_c = 12;
+}
+
+// Serialized ANNIvfPartitionExec for remote execution on PEs.
+// The PE reconstructs the exec using its cached dataset and probes centroids.
+message ANNIvfPartitionExecProto {
+  VectorQueryProto query = 1;
+  TableIdentifier table = 2;
+  repeated string index_uuids = 3;
+}
+
+// Serialized ANNIvfSubIndexExec for remote execution on PEs.
+// The PE reconstructs the exec using its cached dataset.
+message ANNIvfSubIndexExecProto {
+  VectorQueryProto query = 1;
+  TableIdentifier table = 2;
+  // Index identification — PE loads IndexMetadata from its cached dataset.
+  string index_name = 3;
+  repeated string segment_uuids = 4;
+}

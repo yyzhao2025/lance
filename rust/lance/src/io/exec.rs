@@ -8,6 +8,8 @@
 mod filter;
 pub mod filtered_read;
 #[cfg(feature = "substrait")]
+pub mod ann_ivf_proto;
+#[cfg(feature = "substrait")]
 pub mod filtered_read_proto;
 pub mod fts;
 pub(crate) mod knn;
