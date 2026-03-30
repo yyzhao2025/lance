@@ -8,7 +8,6 @@ package lance.datafusion;
 import "table_identifier.proto";
 
 // Serialized vector query parameters.
-// Faithfully round-trips every field in lance_index::vector::Query.
 message VectorQueryProto {
   // Query vector as Arrow IPC bytes (supports Float16, Float32, Float64, UInt8, etc.)
   bytes key_arrow_ipc = 1;
@@ -27,20 +26,15 @@ message VectorQueryProto {
   float dist_q_c = 12;
 }
 
-// Serialized ANNIvfPartitionExec for remote execution on PEs.
-// The PE reconstructs the exec using its cached dataset and probes centroids.
 message ANNIvfPartitionExecProto {
   VectorQueryProto query = 1;
   TableIdentifier table = 2;
   repeated string index_uuids = 3;
 }
 
-// Serialized ANNIvfSubIndexExec for remote execution on PEs.
-// The PE reconstructs the exec using its cached dataset.
 message ANNIvfSubIndexExecProto {
   VectorQueryProto query = 1;
   TableIdentifier table = 2;
-  // Index identification — PE loads IndexMetadata from its cached dataset.
   string index_name = 3;
   repeated string segment_uuids = 4;
 }

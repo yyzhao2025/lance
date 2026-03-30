@@ -5,10 +5,10 @@
 //!
 //! WARNING: Internal API with no stability guarantees.
 
-mod filter;
-pub mod filtered_read;
 #[cfg(feature = "substrait")]
 pub mod ann_ivf_proto;
+mod filter;
+pub mod filtered_read;
 #[cfg(feature = "substrait")]
 pub mod filtered_read_proto;
 pub mod fts;
@@ -19,6 +19,8 @@ mod pushdown_scan;
 mod rowids;
 pub mod scalar_index;
 mod scan;
+#[cfg(feature = "substrait")]
+pub mod table_identifier;
 mod take;
 #[cfg(test)]
 pub mod testing;

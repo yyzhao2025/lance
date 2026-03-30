@@ -21,10 +21,10 @@ use lance_linalg::distance::DistanceType;
 use lance_table::format::IndexMetadata;
 
 use crate::Dataset;
-use crate::dataset::builder::DatasetBuilder;
 use crate::index::DatasetIndexExt;
 
 use super::knn::{ANNIvfPartitionExec, ANNIvfSubIndexExec};
+use super::table_identifier::{open_dataset_from_table_identifier, table_identifier_from_dataset};
 use super::utils::PreFilterSource;
 
 // =============================================================================
@@ -129,7 +129,7 @@ pub fn query_from_proto(proto: pb::VectorQueryProto) -> Result<Query> {
 pub async fn ann_ivf_partition_exec_to_proto(
     exec: &ANNIvfPartitionExec,
 ) -> Result<pb::AnnIvfPartitionExecProto> {
-    let table = super::filtered_read_proto::table_identifier_from_dataset(&exec.dataset).await?;
+    let table = table_identifier_from_dataset(&exec.dataset).await?;
     let query = query_to_proto(&exec.query)?;
 
     Ok(pb::AnnIvfPartitionExecProto {
@@ -162,8 +162,7 @@ pub async fn ann_ivf_partition_exec_from_proto(
 pub async fn ann_ivf_sub_index_exec_to_proto(
     exec: &ANNIvfSubIndexExec,
 ) -> Result<pb::AnnIvfSubIndexExecProto> {
-    let table =
-        super::filtered_read_proto::table_identifier_from_dataset(exec.dataset()).await?;
+    let table = table_identifier_from_dataset(exec.dataset()).await?;
     let query = query_to_proto(exec.query())?;
 
     let indices = exec.indices();
@@ -201,9 +200,7 @@ pub async fn ann_ivf_sub_index_exec_from_proto(
     let query = query_from_proto(query_proto)?;
 
     // Load index metadata from manifest, filter to the requested segments.
-    let all_indices = dataset
-        .load_indices_by_name(&proto.index_name)
-        .await?;
+    let all_indices = dataset.load_indices_by_name(&proto.index_name).await?;
 
     let segment_uuid_set: std::collections::HashSet<String> =
         proto.segment_uuids.into_iter().collect();
@@ -245,29 +242,13 @@ async fn resolve_dataset(
     }
 }
 
-/// Open a dataset from a table identifier proto.
-async fn open_dataset_from_table_identifier(
-    table_id: &pb::TableIdentifier,
-) -> Result<Arc<Dataset>> {
-    let mut builder = DatasetBuilder::from_uri(&table_id.uri).with_version(table_id.version);
-    if let Some(manifest_bytes) = &table_id.serialized_manifest {
-        builder = builder.with_serialized_manifest(manifest_bytes)?;
-    }
-    if !table_id.storage_options.is_empty() {
-        builder = builder.with_storage_options(table_id.storage_options.clone());
-    }
-    Ok(Arc::new(builder.load().await?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::types::{Float16Type, Float32Type, UInt32Type};
+    use arrow_array::types::{Float32Type, UInt32Type};
     use arrow_array::{ArrayRef, Float32Array, Float64Array};
     use half::f16;
     use lance_datagen::{array, gen_batch};
-
-    use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[test]
     fn test_array_ipc_roundtrip_f32() {
@@ -380,6 +361,32 @@ mod tests {
         (Arc::new(ds), dir)
     }
 
+    use crate::index::DatasetIndexExt;
+    use crate::index::vector::VectorIndexParams;
+    use lance_index::IndexType;
+    use lance_index::vector::ivf::IvfBuildParams;
+    use lance_index::vector::pq::PQBuildParams;
+
+    async fn make_indexed_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
+        let (dataset, dir) = make_vector_dataset().await;
+        let mut ds = Dataset::open(dir.path().join("test_ann.lance").to_str().unwrap())
+            .await
+            .unwrap();
+
+        let ivf_params = IvfBuildParams::new(2);
+        let pq_params = PQBuildParams::default();
+        let index_params =
+            VectorIndexParams::with_ivf_pq_params(DistanceType::L2, ivf_params, pq_params);
+
+        ds.create_index(&["vector"], IndexType::Vector, None, &index_params, false)
+            .await
+            .unwrap();
+        let ds = Dataset::open(dir.path().join("test_ann.lance").to_str().unwrap())
+            .await
+            .unwrap();
+        (Arc::new(ds), dir)
+    }
+
     #[tokio::test]
     async fn test_ann_ivf_partition_proto_roundtrip() {
         let (dataset, _dir) = make_vector_dataset().await;
@@ -411,14 +418,84 @@ mod tests {
         assert_eq!(table.version, dataset.manifest.version);
 
         // Roundtrip
-        let back =
-            ann_ivf_partition_exec_from_proto(proto, Some(dataset.clone()))
-                .await
-                .unwrap();
+        let back = ann_ivf_partition_exec_from_proto(proto, Some(dataset.clone()))
+            .await
+            .unwrap();
         assert_eq!(back.query.column, "vector");
         assert_eq!(back.query.k, 10);
         assert_eq!(back.query.minimum_nprobes, 4);
         assert_eq!(back.query.maximum_nprobes, Some(20));
         assert_eq!(back.index_uuids, vec!["uuid-1".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_ann_ivf_sub_index_proto_roundtrip() {
+        let (dataset, _dir) = make_indexed_dataset().await;
+
+        // Get real index metadata from the dataset
+        let indices = dataset.load_indices_by_name("vector_idx").await.unwrap();
+        assert!(!indices.is_empty());
+
+        let key: ArrayRef = Arc::new(Float32Array::from(vec![0.1f32; 128]));
+        let query = Query {
+            column: "vector".to_string(),
+            key,
+            k: 10,
+            lower_bound: None,
+            upper_bound: None,
+            minimum_nprobes: 2,
+            maximum_nprobes: Some(4),
+            ef: None,
+            refine_factor: Some(2),
+            metric_type: Some(DistanceType::L2),
+            use_index: true,
+            dist_q_c: 0.0,
+        };
+
+        // Build the partition exec as input child
+        let partition_exec = ANNIvfPartitionExec::try_new(
+            dataset.clone(),
+            indices.iter().map(|idx| idx.uuid.to_string()).collect(),
+            query.clone(),
+        )
+        .unwrap();
+
+        let exec = ANNIvfSubIndexExec::try_new(
+            Arc::new(partition_exec),
+            dataset.clone(),
+            indices.clone(),
+            query,
+            PreFilterSource::None,
+        )
+        .unwrap();
+
+        // Encode
+        let proto = ann_ivf_sub_index_exec_to_proto(&exec).await.unwrap();
+        assert_eq!(proto.index_name, "vector_idx");
+        assert_eq!(proto.segment_uuids.len(), indices.len());
+
+        // Decode — need a partition exec as input child
+        let input_query = query_from_proto(proto.query.clone().unwrap()).unwrap();
+        let input_partition = ANNIvfPartitionExec::try_new(
+            dataset.clone(),
+            indices.iter().map(|idx| idx.uuid.to_string()).collect(),
+            input_query,
+        )
+        .unwrap();
+
+        let back = ann_ivf_sub_index_exec_from_proto(
+            proto,
+            Some(dataset.clone()),
+            Arc::new(input_partition),
+            PreFilterSource::None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(back.query().column, "vector");
+        assert_eq!(back.query().k, 10);
+        assert_eq!(back.query().minimum_nprobes, 2);
+        assert_eq!(back.query().refine_factor, Some(2));
+        assert_eq!(back.indices().len(), indices.len());
     }
 }
