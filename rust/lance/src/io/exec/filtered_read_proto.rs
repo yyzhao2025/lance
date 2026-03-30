@@ -31,12 +31,7 @@ use crate::Dataset;
 use super::filtered_read::{
     FilteredReadExec, FilteredReadOptions, FilteredReadPlan, FilteredReadThreadingMode,
 };
-
-// Re-export table identifier helpers for backwards compatibility.
-pub use super::table_identifier::{
-    open_dataset_from_table_identifier, table_identifier_from_dataset,
-    table_identifier_from_dataset_with_manifest,
-};
+use super::table_identifier::{open_dataset_from_table_identifier, table_identifier_from_dataset};
 
 // =============================================================================
 // FilteredReadExec <-> Proto
@@ -508,6 +503,7 @@ mod tests {
     use roaring::RoaringBitmap;
     use std::collections::HashSet;
 
+    use crate::io::exec::table_identifier::table_identifier_from_dataset_with_manifest;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
 
     #[test]

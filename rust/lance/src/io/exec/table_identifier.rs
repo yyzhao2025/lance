@@ -68,3 +68,102 @@ pub async fn open_dataset_from_table_identifier(
     }
     Ok(Arc::new(builder.load().await?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::RecordBatchIterator;
+    use arrow_array::types::UInt32Type;
+    use lance_datagen::{array, gen_batch};
+    use std::collections::HashMap;
+
+    async fn make_test_dataset() -> (Arc<Dataset>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let batch = gen_batch()
+            .col("x", array::step::<UInt32Type>())
+            .col("y", array::step::<UInt32Type>())
+            .into_batch_rows(lance_datagen::RowCount::from(100))
+            .unwrap();
+        let path = dir.path().join("test.lance");
+        let ds = Dataset::write(
+            RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema()),
+            path.to_str().unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        (Arc::new(ds), dir)
+    }
+
+    #[test]
+    fn test_table_identifier_proto_roundtrip() {
+        let id = pb::TableIdentifier {
+            uri: "s3://bucket/table.lance".to_string(),
+            version: 42,
+            manifest_etag: Some("etag123".to_string()),
+            serialized_manifest: None,
+            storage_options: HashMap::new(),
+        };
+        let bytes = id.encode_to_vec();
+        let back = pb::TableIdentifier::decode(bytes.as_slice()).unwrap();
+        assert_eq!(id.uri, back.uri);
+        assert_eq!(id.version, back.version);
+        assert_eq!(id.manifest_etag, back.manifest_etag);
+        assert!(back.serialized_manifest.is_none());
+    }
+
+    #[test]
+    fn test_table_identifier_proto_with_storage_options() {
+        let mut opts = HashMap::new();
+        opts.insert("region".to_string(), "us-east-1".to_string());
+        opts.insert("endpoint".to_string(), "https://s3.example.com".to_string());
+
+        let id = pb::TableIdentifier {
+            uri: "s3://bucket/table.lance".to_string(),
+            version: 7,
+            manifest_etag: None,
+            serialized_manifest: None,
+            storage_options: opts.clone(),
+        };
+        let bytes = id.encode_to_vec();
+        let back = pb::TableIdentifier::decode(bytes.as_slice()).unwrap();
+        assert_eq!(back.storage_options, opts);
+    }
+
+    #[tokio::test]
+    async fn test_table_identifier_from_dataset_roundtrip() {
+        let (dataset, _dir) = make_test_dataset().await;
+
+        let id = table_identifier_from_dataset(&dataset).await.unwrap();
+        assert_eq!(id.uri, dataset.uri());
+        assert_eq!(id.version, dataset.manifest.version);
+        assert!(id.serialized_manifest.is_none());
+
+        // Roundtrip: open the dataset back from the identifier
+        let back = open_dataset_from_table_identifier(&id).await.unwrap();
+        assert_eq!(back.uri(), dataset.uri());
+        assert_eq!(back.manifest.version, dataset.manifest.version);
+    }
+
+    #[tokio::test]
+    async fn test_table_identifier_with_manifest_roundtrip() {
+        let (dataset, _dir) = make_test_dataset().await;
+
+        let id = table_identifier_from_dataset_with_manifest(&dataset)
+            .await
+            .unwrap();
+        assert_eq!(id.uri, dataset.uri());
+        assert_eq!(id.version, dataset.manifest.version);
+        assert!(id.serialized_manifest.is_some());
+
+        // Verify the serialized manifest bytes decode
+        let manifest_bytes = id.serialized_manifest.as_ref().unwrap();
+        let _manifest_proto =
+            lance_table::format::pb::Manifest::decode(manifest_bytes.as_slice()).unwrap();
+
+        // Roundtrip: open the dataset back from the identifier (with manifest)
+        let back = open_dataset_from_table_identifier(&id).await.unwrap();
+        assert_eq!(back.uri(), dataset.uri());
+        assert_eq!(back.manifest.version, dataset.manifest.version);
+    }
+}
