@@ -60,7 +60,6 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::pin::Pin;
 use std::sync::Arc;
-use take::row_offsets_to_row_addresses;
 use tracing::{info, instrument};
 
 pub(crate) mod blob;
@@ -87,6 +86,8 @@ pub mod udtf;
 pub mod updater;
 mod utils;
 pub mod write;
+
+pub(crate) use take::row_offsets_to_row_addresses;
 
 use self::builder::DatasetBuilder;
 use self::cleanup::RemovalStats;
@@ -2790,7 +2791,7 @@ impl Dataset {
             IndexType::IvfFlat | IndexType::IvfPq | IndexType::IvfSq | IndexType::Vector => {
                 Err(Error::invalid_input(
                     "Vector distributed indexing no longer supports merge_index_metadata; \
-                     build segments, use create_index_segment_builder(), \
+                     build segments, optionally merge groups with merge_existing_index_segments(...), \
                      and commit with commit_existing_index_segments(...)"
                         .to_string(),
                 ))

@@ -21,6 +21,7 @@ members = [
     "rust/compression/fsst",
     "rust/compression/bitpacking",
     "rust/arrow-scalar",
+    "rust/arrow-stats",
 ]
 exclude = ["python", "java/lance-jni"]
 # Python package needs to be built by maturin.
@@ -74,6 +75,7 @@ approx = "0.5.1"
 # Note that this one does not include pyarrow
 arrow = { version = "57.0.0", optional = false, features = ["prettyprint"] }
 lance-arrow-scalar = { version = "=57.0.0", path = "./rust/arrow-scalar" }
+lance-arrow-stats = { version = "=57.0.0", path = "./rust/arrow-stats" }
 arrow-arith = "57.0.0"
 arrow-array = "57.0.0"
 arrow-buffer = "57.0.0"
@@ -146,6 +148,7 @@ geo-types = "0.7.16"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
+io-uring = "0.7"
 itertools = "0.13"
 jieba-rs = { version = "0.8.1", default-features = false }
 jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }
@@ -177,6 +180,7 @@ rustc_version = "0.4"
 serde = { version = "^1" }
 serde_json = { version = "1" }
 semver = "1.0"
+serial_test = "3"
 slatedb = "0.3"
 snafu = "0.9"
 strum = "0.26"
