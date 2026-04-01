@@ -3266,8 +3266,13 @@ class LanceDataset(pa.dataset.Dataset):
             Accepted accelerator:
 
             - "cuda" or ``torch.device(...)`` for the existing torch-based path
+              on NVIDIA GPUs
             - "mps" for Apple Silicon GPU
-            - "cuvs" for the explicit cuVS-based IVF_PQ training path
+            - "cuvs" for the explicit cuVS-based IVF_PQ training path on NVIDIA
+              GPUs
+
+            The cuVS path also requires the cuVS Python bindings to be installed
+            separately.
 
             If not set, use the CPU.
         index_cache_size : int, optional
@@ -3377,10 +3382,13 @@ class LanceDataset(pa.dataset.Dataset):
         Experimental Accelerator (GPU) support:
 
         - *accelerate*: use GPU to train IVF partitions.
-            `accelerator="cuda"` and `accelerator="mps"` use the existing torch path.
-            `accelerator="cuvs"` uses cuVS for IVF_PQ training only.
-            The torch path requires PyTorch. The cuVS path requires the cuVS Python
-            bindings to be installed separately.
+            `accelerator="cuda"` and `accelerator="mps"` use the existing torch
+            path. `accelerator="cuda"` runs on NVIDIA GPUs and `accelerator="mps"`
+            runs on Apple Silicon GPUs. `accelerator="cuvs"` uses cuVS for IVF_PQ
+            training only and requires an NVIDIA GPU.
+
+            The torch path requires PyTorch. The cuVS path requires the cuVS
+            Python bindings to be installed separately.
 
         .. code-block:: python
 
