@@ -655,6 +655,54 @@ def test_prepare_global_ivf_pq_cuvs_dispatch(tmp_path, monkeypatch):
     assert prepared["pq_codebook"].shape == (16, 256, 8)
 
 
+def test_train_ivf_pq_on_cuvs_nullable_vectors(tmp_path, monkeypatch):
+    tbl = create_table(nvec=32, ndim=16, nullify=True)
+    dataset = lance.write_dataset(tbl, tmp_path)
+
+    class FakeIndex:
+        centers = np.random.randn(4, 16).astype(np.float32)
+        pq_centers = np.random.randn(4, 256, 4).astype(np.float32)
+
+    class FakeIvfPqModule:
+        class IndexParams:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        @staticmethod
+        def build(build_params, matrix):
+            assert build_params.kwargs["n_lists"] == 4
+            assert matrix.shape[1] == 16
+            assert matrix.dtype == np.float32
+            return FakeIndex()
+
+    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: FakeIvfPqModule())
+
+    centroids, pq_codebook = lance_cuvs.train_ivf_pq_on_cuvs(
+        dataset,
+        "vector",
+        4,
+        "L2",
+        "cuvs",
+        4,
+        sample_rate=4,
+    )
+
+    assert centroids.shape == (4, 16)
+    assert pq_codebook.shape == (4, 256, 4)
+
+
+def test_cuvs_as_numpy_prefers_copy_to_host():
+    class FakeDeviceTensor:
+        def copy_to_host(self):
+            return np.arange(6, dtype=np.float32).reshape(2, 3)
+
+    array = lance_cuvs._as_numpy(FakeDeviceTensor())
+
+    assert isinstance(array, np.ndarray)
+    assert array.shape == (2, 3)
+    assert array.dtype == np.float32
+
+
 def test_use_index(dataset, tmp_path):
     ann_ds = lance.write_dataset(dataset.to_table(), tmp_path / "indexed.lance")
     ann_ds = ann_ds.create_index(

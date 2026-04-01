@@ -7,6 +7,7 @@ from importlib import import_module
 from typing import Tuple
 
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from .dependencies import numpy as np
 
@@ -64,6 +65,10 @@ def _column_to_numpy(table: pa.Table, column: str) -> np.ndarray:
 def _as_numpy(array_like) -> np.ndarray:
     if isinstance(array_like, np.ndarray):
         return array_like
+
+    if hasattr(array_like, "copy_to_host"):
+        return np.asarray(array_like.copy_to_host())
+
     try:
         array = np.asarray(array_like)
         if isinstance(array, np.ndarray):
@@ -122,6 +127,20 @@ def _estimate_trainset_fraction(
     return min(1.0, desired_rows / num_rows)
 
 
+def _sample_training_table(dataset, column: str, train_rows: int, filt: str | None) -> pa.Table:
+    if filt is None:
+        return dataset.sample(train_rows, columns=[column], randomize_order=True)
+
+    total_rows = dataset.count_rows()
+    sample_rows = min(total_rows, max(train_rows * 2, train_rows + 1024))
+    trainset = dataset.sample(sample_rows, columns=[column], randomize_order=True)
+    trainset = trainset.filter(pc.is_valid(trainset.column(column)))
+    if len(trainset) >= train_rows or sample_rows == total_rows:
+        return trainset.slice(0, min(train_rows, len(trainset)))
+
+    return dataset.to_table(columns=[column], filter=filt, limit=train_rows)
+
+
 def train_ivf_pq_on_cuvs(
     dataset,
     column: str,
@@ -157,12 +176,7 @@ def train_ivf_pq_on_cuvs(
         raise ValueError("cuVS training requires at least one non-null training vector")
 
     train_rows = max(1, min(num_rows, max(num_partitions * sample_rate, 256 * 256)))
-    trainset = dataset.sample(
-        train_rows,
-        columns=[column],
-        filter=filt,
-        randomize_order=True,
-    )
+    trainset = _sample_training_table(dataset, column, train_rows, filt)
     matrix = _column_to_numpy(trainset, column)
 
     ivf_pq = _require_cuvs()
