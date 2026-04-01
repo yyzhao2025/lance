@@ -2961,13 +2961,13 @@ class LanceDataset(pa.dataset.Dataset):
 
             if use_cuvs:
                 from .cuvs import (
+                    _train_ivf_pq_index_on_cuvs,
                     one_pass_assign_ivf_pq_on_cuvs,
-                    one_pass_train_ivf_pq_on_cuvs,
                 )
 
                 LOGGER.info("Doing one-pass ivfpq cuVS training")
                 timers["ivf+pq_train:start"] = time.time()
-                ivf_centroids, pq_codebook = one_pass_train_ivf_pq_on_cuvs(
+                trained_index, ivf_centroids, pq_codebook = _train_ivf_pq_index_on_cuvs(
                     self,
                     column[0],
                     num_partitions,
@@ -2995,6 +2995,7 @@ class LanceDataset(pa.dataset.Dataset):
                     accelerator,
                     ivf_centroids,
                     pq_codebook,
+                    trained_index=trained_index,
                     batch_size=20480,
                     filter_nan=filter_nan,
                 )

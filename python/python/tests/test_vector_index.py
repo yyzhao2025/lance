@@ -542,6 +542,10 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
     dataset = lance.write_dataset(tbl, tmp_path)
     calls = {}
 
+    class FakeIndex:
+        pq_dim = 16
+        pq_bits = 8
+
     def fake_train(
         dataset_arg,
         column,
@@ -566,6 +570,7 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
         calls["num_bits"] = num_bits
         calls["filter_nan"] = filter_nan
         return (
+            FakeIndex(),
             np.random.randn(num_partitions, 128).astype(np.float32),
             np.random.randn(num_sub_vectors, 256, 128 // num_sub_vectors).astype(
                 np.float32
@@ -579,6 +584,7 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
         accelerator,
         ivf_centroids,
         pq_codebook,
+        trained_index=None,
         dst_dataset_uri=None,
         batch_size=20480,
         *,
@@ -588,6 +594,7 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
         calls["assign_column"] = column
         calls["assign_metric_type"] = metric_type
         calls["assign_accelerator"] = accelerator
+        calls["assign_trained_index"] = trained_index
         calls["assign_batch_size"] = batch_size
         calls["assign_filter_nan"] = filter_nan
 
@@ -612,7 +619,7 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
         ]
         return shuffle_ds_uri, shuffle_buffers
 
-    monkeypatch.setattr(lance_cuvs, "one_pass_train_ivf_pq_on_cuvs", fake_train)
+    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_index_on_cuvs", fake_train)
     monkeypatch.setattr(lance_cuvs, "one_pass_assign_ivf_pq_on_cuvs", fake_assign)
 
     dataset = dataset.create_index(
@@ -631,6 +638,7 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
     assert calls["assign_column"] == "vector"
     assert calls["assign_metric_type"] == "L2"
     assert calls["assign_accelerator"] == "cuvs"
+    assert isinstance(calls["assign_trained_index"], FakeIndex)
     assert dataset.stats.index_stats("vector_idx")["index_type"] == "IVF_PQ"
 
 
@@ -747,12 +755,44 @@ def test_cuvs_as_numpy_prefers_copy_to_host():
     assert array.dtype == np.float32
 
 
-def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path):
+def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path, monkeypatch):
     tbl = create_table(nvec=32, ndim=16)
     dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_src")
 
     ivf_centroids = np.random.randn(4, 16).astype(np.float32)
     pq_codebook = np.random.randn(4, 256, 4).astype(np.float32)
+
+    class FakeDeviceTensor:
+        def __init__(self, array):
+            self._array = array
+
+        def copy_to_host(self):
+            return self._array
+
+    class FakeCupyArray:
+        def __init__(self, array):
+            self.array = array
+
+    class FakeCupyModule:
+        @staticmethod
+        def asarray(array):
+            return FakeCupyArray(array)
+
+    class FakeIndex:
+        pq_dim = 4
+        pq_bits = 8
+
+    class FakeIvfPqModule:
+        @staticmethod
+        def transform(index, vectors):
+            assert isinstance(index, FakeIndex)
+            assert isinstance(vectors, FakeCupyArray)
+            labels = np.arange(len(vectors.array), dtype=np.uint32) % 4
+            pq_codes = np.full((len(vectors.array), 4), 7, dtype=np.uint8)
+            return FakeDeviceTensor(labels), FakeDeviceTensor(pq_codes)
+
+    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: FakeIvfPqModule())
+    monkeypatch.setattr(lance_cuvs, "_optional_cupy", lambda: FakeCupyModule())
 
     shuffle_uri, shuffle_buffers = lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
         dataset,
@@ -761,6 +801,7 @@ def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path):
         "cuvs",
         ivf_centroids,
         pq_codebook,
+        trained_index=FakeIndex(),
         batch_size=8,
     )
 
