@@ -8,21 +8,17 @@ use std::sync::Arc;
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct OptimizeOptions {
-    /// Number of existing index segments to merge for one column. Default: 1.
+    /// Number of delta indices to merge for one column. Default: 1.
     ///
-    /// In current vector optimize paths, `None` means Lance may either append a
-    /// new segment or merge all existing segments, depending on whether a
-    /// partition split is required.
+    /// If `num_indices_to_merge` is None, lance will create a new delta index if no partition is split, otherwise it will merge all delta indices.
+    /// If `num_indices_to_merge` is Some(N), the delta updates and latest N indices
+    /// will be merged into one single index.
     ///
-    /// If `num_indices_to_merge` is `Some(N)`, the latest N existing segments
-    /// together with any newly-built data will be merged into one segment.
+    /// It is up to the caller to decide how many indices to merge / keep. Callers can
+    /// find out how many indices are there by calling `Dataset::index_statistics`.
     ///
-    /// It is up to the caller to decide how many segments to merge / keep.
-    /// Callers can find out how many committed segments exist by calling
-    /// `Dataset::index_statistics`.
-    ///
-    /// A common usage pattern is to keep a large retained segment snapshot and
-    /// periodically merge newer segments back into that snapshot.
+    /// A common usage pattern will be that, the caller can keep a large snapshot of the index of the base version,
+    /// and accumulate a few delta indices, then merge them into the snapshot.
     pub num_indices_to_merge: Option<usize>,
 
     /// the index names to optimize. If None, all indices will be optimized.

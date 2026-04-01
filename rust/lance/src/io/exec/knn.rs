@@ -347,19 +347,18 @@ pub fn new_knn_exec(
 ///
 /// It searches the partition IDs using the input query.
 ///
-/// It searches all candidate segments in parallel. For each segment it
-/// returns a single batch with the partition IDs and that index `uuid`:
+/// It searches all index deltas in parallel.  For each delta it returns a
+/// single batch with the partition IDs and the delta index `uuid`:
 ///
 /// The number of partitions returned is at most `maximum_nprobes`.  If
 /// `maximum_nprobes` is not set, it will return all partitions.  The partitions
 /// are returned in sorted order from closest to farthest.
 ///
-/// Typically, all partition ids will be identical for each segment since
-/// they share the same IVF centroids, but the downstream nodes do not rely on
-/// this.
+/// Typically, all partition ids will be identical for each delta index (since delta
+/// indices have identical partitions) but the downstream nodes do not rely on this.
 ///
-/// TODO: We may want to search the partitions once instead of once per
-/// segment since the centroids are the same.
+/// TODO: We may want to search the partitions once instead of once per delta index
+/// since the centroids are the same.
 ///
 /// ```text
 /// {
@@ -571,14 +570,12 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 ///   AnnPartitionExec: nprobes=20
 /// ```
 ///
-/// The partition index returns one batch per segment with
-/// `maximum_nprobes` partitions in sorted order.
+/// The partition index returns one batch per delta with `maximum_nprobes` partitions in sorted order.
 ///
 /// The sub-index then runs a KNN search on each partition in parallel.
 ///
-/// First, the index will search `minimum_probes` partitions on each
-/// segment. If there are enough results at that point to satisfy K then the
-/// results will be sorted and returned.
+/// First, the index will search `minimum_probes` partitions on each delta.  If there are enough results
+/// at that point to satisfy K then the results will be sorted and returned.
 ///
 /// If there are not enough results then the prefilter will be consulted to determine how many potential
 /// results exist.  If the number is smaller than K then those additional results will be fetched directly
@@ -772,9 +769,8 @@ impl ANNIvfSubIndexExec {
 
                 // This next if check should be true, because we wouldn't get max_results otherwise
                 if let Some(iter_addrs) = prefilter_mask.iter_addrs() {
-                    // We only run this on the first segment because the
-                    // prefilter mask is shared by all segments and we don't want
-                    // to duplicate the rows.
+                    // We only run this on the first delta because the prefilter mask is shared
+                    // by all deltas and we don't want to duplicate the rows.
                     if state
                         .took_no_rows_shortcut
                         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -796,9 +792,8 @@ impl ANNIvfSubIndexExec {
                         .unwrap();
                         return futures::stream::once(async move { Ok(not_found_batch) }).boxed();
                     } else {
-                        // We meet all the criteria for an early exit, but we
-                        // are not the first segment so we just return an
-                        // empty stream and skip the late search.
+                        // We meet all the criteria for an early exit, but we aren't first
+                        // delta so we just return an empty stream and skip the late search
                         return futures::stream::empty().boxed();
                     }
                 }
@@ -986,8 +981,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
         let metrics_clone = metrics.clone();
         let timer = Instant::now();
 
-        // Per-segment stream:
-        //   Stream<(partitions, index uuid)>
+        // Per-delta-index stream:
+        //   Stream<(parttitions, index uuid)>
         let per_index_stream = input_stream
             .and_then(move |batch| {
                 let part_id_col = batch.column_by_name(PART_ID_COLUMN).unwrap_or_else(|| {
@@ -1081,9 +1076,8 @@ impl ExecutionPlan for ANNIvfSubIndexExec {
                     }
                 })
                 // Must use flatten_unordered to avoid deadlock.
-                // Each per-segment stream is split into an early and late
-                // search. The late search will not start until the early
-                // search is complete across all segments.
+                // Each delta stream is split into an early and late search.  The late search
+                // will not start until the early search is complete across all deltas.
                 .try_flatten_unordered(None)
                 .finally(move || {
                     metrics_clone

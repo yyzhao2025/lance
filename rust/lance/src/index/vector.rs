@@ -569,7 +569,6 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-
             IvfIndexBuilder::<FlatIndex, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
@@ -595,21 +594,42 @@ pub(crate) async fn build_distributed_vector_index(
                 )));
             };
 
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
-                filtered_dataset,
-                column.to_owned(),
-                index_dir.clone(),
-                params.metric_type,
-                shuffler,
-                Some(ivf_params),
-                Some(()),
-                hnsw_params.clone(),
-                frag_reuse_index,
-            )?
-            .with_fragment_filter(fragment_filter)
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            match element_type {
+                DataType::UInt8 => {
+                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                        filtered_dataset,
+                        column.to_owned(),
+                        index_dir.clone(),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_fragment_filter(fragment_filter)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+                _ => {
+                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                        filtered_dataset,
+                        column.to_owned(),
+                        index_dir.clone(),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_fragment_filter(fragment_filter)
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+            }
         }
 
         IndexType::IvfHnswPq => {
@@ -664,7 +684,6 @@ pub(crate) async fn build_distributed_vector_index(
                     stages
                 )));
             };
-
             IvfIndexBuilder::<HNSW, ScalarQuantizer>::new(
                 filtered_dataset,
                 column.to_owned(),
@@ -683,11 +702,34 @@ pub(crate) async fn build_distributed_vector_index(
         }
 
         IndexType::IvfRq => {
-            return Err(Error::index(format!(
-                "Build Distributed Vector Index: invalid index type: {:?} \
-            is not supported in distributed mode; skipping this shard",
-                index_type
-            )));
+            let StageParams::RQ(rq_params) = &stages[1] else {
+                return Err(Error::index(format!(
+                    "Build Distributed Vector Index: invalid stages: {:?}",
+                    stages
+                )));
+            };
+
+            let ivf_model = make_ivf_model();
+
+            IvfIndexBuilder::<FlatIndex, RabitQuantizer>::new(
+                filtered_dataset,
+                column.to_owned(),
+                index_dir.clone(),
+                params.metric_type,
+                shuffler,
+                Some(ivf_params),
+                Some(rq_params.clone()),
+                (),
+                frag_reuse_index,
+            )?
+            .with_ivf(ivf_model)
+            // For distributed shards, keep RQ codes in row-major layout.
+            // A single packing pass is performed in the distributed merge stage.
+            .with_transpose(false)
+            .with_fragment_filter(fragment_filter)
+            .with_progress(progress.clone())
+            .build()
+            .await?;
         }
 
         _ => {
@@ -864,20 +906,40 @@ pub(crate) async fn build_vector_index(
                     stages
                 )));
             };
-            IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
-                dataset.clone(),
-                column.to_owned(),
-                dataset.indices_dir().child(uuid),
-                params.metric_type,
-                shuffler,
-                Some(ivf_params),
-                Some(()),
-                hnsw_params.clone(),
-                frag_reuse_index,
-            )?
-            .with_progress(progress.clone())
-            .build()
-            .await?;
+            match element_type {
+                DataType::UInt8 => {
+                    IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+                _ => {
+                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new(
+                        dataset.clone(),
+                        column.to_owned(),
+                        dataset.indices_dir().child(uuid),
+                        params.metric_type,
+                        shuffler,
+                        Some(ivf_params),
+                        Some(()),
+                        hnsw_params.clone(),
+                        frag_reuse_index,
+                    )?
+                    .with_progress(progress.clone())
+                    .build()
+                    .await?;
+                }
+            }
         }
         IndexType::IvfHnswPq => {
             let StageParams::Hnsw(hnsw_params) = &stages[1] else {
@@ -945,10 +1007,8 @@ pub(crate) async fn build_vector_index(
     Ok(())
 }
 
-/// Build a vector index incrementally using an existing index's IVF model and quantizer.
-///
-/// The new index reuses the source centroids and quantizer so the appended
-/// segment stays compatible with the existing IVF layout.
+/// Build a Vector Index incrementally using an existing index's IVF model and quantizer
+/// This creates a delta index that shares centroids with the source index
 #[instrument(level = "debug", skip(dataset, existing_index, frag_reuse_index))]
 pub(crate) async fn build_vector_index_incremental(
     dataset: &Dataset,
@@ -1127,23 +1187,42 @@ pub(crate) async fn build_vector_index_incremental(
             };
 
             match quantization_type {
-                QuantizationType::Flat => {
-                    IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
-                        dataset.clone(),
-                        column.to_owned(),
-                        index_dir,
-                        params.metric_type,
-                        shuffler,
-                        hnsw_params.clone(),
-                        frag_reuse_index,
-                        OptimizeOptions::append(),
-                    )?
-                    .with_ivf(ivf_model)
-                    .with_quantizer(quantizer.try_into()?)
-                    .with_progress(progress.clone())
-                    .build()
-                    .await?;
-                }
+                QuantizationType::Flat => match element_type {
+                    DataType::UInt8 => {
+                        IvfIndexBuilder::<HNSW, FlatBinQuantizer>::new_incremental(
+                            dataset.clone(),
+                            column.to_owned(),
+                            index_dir,
+                            params.metric_type,
+                            shuffler,
+                            hnsw_params.clone(),
+                            frag_reuse_index,
+                            OptimizeOptions::append(),
+                        )?
+                        .with_ivf(ivf_model)
+                        .with_quantizer(quantizer.try_into()?)
+                        .with_progress(progress.clone())
+                        .build()
+                        .await?;
+                    }
+                    _ => {
+                        IvfIndexBuilder::<HNSW, FlatQuantizer>::new_incremental(
+                            dataset.clone(),
+                            column.to_owned(),
+                            index_dir,
+                            params.metric_type,
+                            shuffler,
+                            hnsw_params.clone(),
+                            frag_reuse_index,
+                            OptimizeOptions::append(),
+                        )?
+                        .with_ivf(ivf_model)
+                        .with_quantizer(quantizer.try_into()?)
+                        .with_progress(progress.clone())
+                        .build()
+                        .await?;
+                    }
+                },
                 QuantizationType::Product => {
                     IvfIndexBuilder::<HNSW, ProductQuantizer>::new_incremental(
                         dataset.clone(),
@@ -1440,11 +1519,10 @@ pub(crate) async fn open_vector_index_v2(
     Ok(index)
 }
 
-/// Initialize a vector index from a source dataset.
-///
-/// This reuses the centroids from the source dataset so the initialized index
-/// starts from the same IVF layout and can be retained independently by the
-/// target dataset over time.
+/// Initialize a vector index from a source dataset
+/// This will reuse the centroids from the source dataset,
+/// making the new indices basically a "delta index" of the source dataset,
+/// until the new dataset fully retains the index.
 pub async fn initialize_vector_index(
     target_dataset: &mut Dataset,
     source_dataset: &Dataset,
@@ -1587,7 +1665,7 @@ pub async fn initialize_vector_index(
     Ok(())
 }
 
-/// Create IVF build parameters for incremental index creation from an existing IVF model.
+/// Create IVF build parameters for delta index creation from an existing IVF model
 /// TODO: support deriving all the original parameters
 fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
     IvfBuildParams {
@@ -1821,8 +1899,7 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same, which keeps appended index
-        // entries compatible with the retained IVF layout.
+        // Verify the centroids are exactly the same (key verification for delta indices)
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -2041,8 +2118,7 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same, which keeps appended index
-        // entries compatible with the retained IVF layout.
+        // Verify the centroids are exactly the same (key verification for delta indices)
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -2146,6 +2222,7 @@ mod tests {
             dim,
             MetricType::L2,
             &ivf_params,
+            None,
             noop_progress(),
         )
         .await
@@ -2198,6 +2275,7 @@ mod tests {
             dim,
             MetricType::L2,
             &ivf_params,
+            None,
             noop_progress(),
         )
         .await
@@ -2730,8 +2808,7 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same, which keeps appended index
-        // entries compatible with the retained IVF layout.
+        // Verify the centroids are exactly the same (key verification for delta indices)
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -2953,8 +3030,7 @@ mod tests {
             "Source and target should have same number of partitions"
         );
 
-        // Verify the centroids are exactly the same, which keeps appended index
-        // entries compatible with the retained IVF layout.
+        // Verify the centroids are exactly the same (key verification for delta indices)
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
@@ -3224,8 +3300,7 @@ mod tests {
             "SQ should use 8 bits"
         );
 
-        // Verify the centroids are exactly the same, which keeps appended index
-        // entries compatible with the retained IVF layout.
+        // Verify the centroids are exactly the same (key verification for delta indices)
         if let (Some(source_centroids), Some(target_centroids)) =
             (&source_ivf_model.centroids, &target_ivf_model.centroids)
         {
