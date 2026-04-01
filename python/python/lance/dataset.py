@@ -2960,7 +2960,10 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
             if use_cuvs:
-                from .cuvs import one_pass_train_ivf_pq_on_cuvs
+                from .cuvs import (
+                    one_pass_assign_ivf_pq_on_cuvs,
+                    one_pass_train_ivf_pq_on_cuvs,
+                )
 
                 LOGGER.info("Doing one-pass ivfpq cuVS training")
                 timers["ivf+pq_train:start"] = time.time()
@@ -2981,6 +2984,29 @@ class LanceDataset(pa.dataset.Dataset):
                     timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
                 )
                 LOGGER.info("cuVS ivf+pq training time: %ss", ivfpq_train_time)
+                timers["ivf+pq_assign:start"] = time.time()
+                (
+                    shuffle_output_dir,
+                    shuffle_buffers,
+                ) = one_pass_assign_ivf_pq_on_cuvs(
+                    self,
+                    column[0],
+                    metric,
+                    accelerator,
+                    ivf_centroids,
+                    pq_codebook,
+                    batch_size=20480,
+                    filter_nan=filter_nan,
+                )
+                timers["ivf+pq_assign:end"] = time.time()
+                ivfpq_assign_time = (
+                    timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+                )
+                LOGGER.info("cuVS ivf+pq transform time: %ss", ivfpq_assign_time)
+                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
+                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
+                    shuffle_output_dir, "data"
+                )
             else:
                 from .vector import (
                     one_pass_assign_ivf_pq_on_accelerator,

@@ -572,7 +572,48 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
             ),
         )
 
+    def fake_assign(
+        dataset_arg,
+        column,
+        metric_type,
+        accelerator,
+        ivf_centroids,
+        pq_codebook,
+        dst_dataset_uri=None,
+        batch_size=20480,
+        *,
+        filter_nan,
+    ):
+        calls["assign_dataset"] = dataset_arg
+        calls["assign_column"] = column
+        calls["assign_metric_type"] = metric_type
+        calls["assign_accelerator"] = accelerator
+        calls["assign_batch_size"] = batch_size
+        calls["assign_filter_nan"] = filter_nan
+
+        row_ids = dataset_arg.to_table(columns=[], with_row_id=True)[
+            "_rowid"
+        ].to_numpy()
+        part_ids = pa.array(np.zeros(len(row_ids), dtype=np.uint32))
+        pq_values = pa.array(np.zeros(len(row_ids) * 16, dtype=np.uint8))
+        pq_codes = pa.FixedSizeListArray.from_arrays(pq_values, 16)
+        shuffle_ds_uri = str(tmp_path / "cuvs_shuffle_buffers")
+        shuffle_ds = lance.write_dataset(
+            pa.Table.from_arrays(
+                [pa.array(row_ids), part_ids, pq_codes],
+                names=["row_id", "__ivf_part_id", "__pq_code"],
+            ),
+            shuffle_ds_uri,
+        )
+        shuffle_buffers = [
+            data_file.path
+            for frag in shuffle_ds.get_fragments()
+            for data_file in frag.data_files()
+        ]
+        return shuffle_ds_uri, shuffle_buffers
+
     monkeypatch.setattr(lance_cuvs, "one_pass_train_ivf_pq_on_cuvs", fake_train)
+    monkeypatch.setattr(lance_cuvs, "one_pass_assign_ivf_pq_on_cuvs", fake_assign)
 
     dataset = dataset.create_index(
         "vector",
@@ -587,6 +628,9 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
     assert calls["metric_type"] == "L2"
     assert calls["accelerator"] == "cuvs"
     assert calls["num_sub_vectors"] == 16
+    assert calls["assign_column"] == "vector"
+    assert calls["assign_metric_type"] == "L2"
+    assert calls["assign_accelerator"] == "cuvs"
     assert dataset.stats.index_stats("vector_idx")["index_type"] == "IVF_PQ"
 
 
@@ -701,6 +745,32 @@ def test_cuvs_as_numpy_prefers_copy_to_host():
     assert isinstance(array, np.ndarray)
     assert array.shape == (2, 3)
     assert array.dtype == np.float32
+
+
+def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path):
+    tbl = create_table(nvec=32, ndim=16)
+    dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_src")
+
+    ivf_centroids = np.random.randn(4, 16).astype(np.float32)
+    pq_codebook = np.random.randn(4, 256, 4).astype(np.float32)
+
+    shuffle_uri, shuffle_buffers = lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
+        dataset,
+        "vector",
+        "l2",
+        "cuvs",
+        ivf_centroids,
+        pq_codebook,
+        batch_size=8,
+    )
+
+    shuffle_ds = lance.dataset(shuffle_uri)
+    batch = next(shuffle_ds.to_batches())
+
+    assert len(shuffle_buffers) > 0
+    assert batch.column("row_id").type == pa.uint64()
+    assert batch.column("__ivf_part_id").type == pa.uint32()
+    assert batch.column("__pq_code").type == pa.list_(pa.uint8(), 4)
 
 
 def test_use_index(dataset, tmp_path):

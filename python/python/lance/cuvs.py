@@ -3,13 +3,20 @@
 
 from __future__ import annotations
 
+import re
+import tempfile
 from importlib import import_module
-from typing import Tuple
+from typing import TYPE_CHECKING, Iterator, Tuple
 
 import pyarrow as pa
 import pyarrow.compute as pc
 
 from .dependencies import numpy as np
+from .log import LOGGER
+from .util import _normalize_metric_type
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def is_cuvs_accelerator(accelerator: object) -> bool:
@@ -34,8 +41,33 @@ def _optional_cupy():
         return None
 
 
+def _xp_module():
+    cupy = _optional_cupy()
+    return cupy if cupy is not None else np
+
+
+def _make_progress(total: int):
+    try:
+        from tqdm.auto import tqdm
+
+        return tqdm(total=total)
+    except ModuleNotFoundError:
+
+        class _NoOpProgress:
+            def set_description(self, _description: str):
+                return None
+
+            def update(self, _count: int):
+                return None
+
+            def close(self):
+                return None
+
+        return _NoOpProgress()
+
+
 def _metric_to_cuvs(metric_type: str) -> str:
-    metric_type = metric_type.lower()
+    metric_type = _normalize_metric_type(metric_type).lower()
     if metric_type in {"l2", "euclidean"}:
         return "sqeuclidean"
     if metric_type == "dot":
@@ -45,12 +77,7 @@ def _metric_to_cuvs(metric_type: str) -> str:
     raise ValueError(f"Metric '{metric_type}' is not supported by cuVS IVF_PQ")
 
 
-def _column_to_numpy(table: pa.Table, column: str) -> np.ndarray:
-    array = table.column(column).combine_chunks()
-    values = array.to_pylist()
-    if len(values) == 0:
-        raise ValueError("cuVS training requires at least one training vector")
-    matrix = np.asarray(values)
+def _coerce_float_matrix(matrix: np.ndarray, *, column: str) -> np.ndarray:
     if matrix.ndim != 2:
         raise ValueError(
             f"Expected a 2D training matrix for column '{column}', got {matrix.shape}"
@@ -60,6 +87,22 @@ def _column_to_numpy(table: pa.Table, column: str) -> np.ndarray:
     elif matrix.dtype not in (np.float16, np.float32):
         matrix = matrix.astype(np.float32)
     return matrix
+
+
+def _column_to_numpy(table: pa.Table | pa.RecordBatch, column: str) -> np.ndarray:
+    array = table.column(column)
+    if isinstance(array, pa.ChunkedArray):
+        array = array.combine_chunks()
+    if len(array) == 0:
+        raise ValueError("cuVS training requires at least one training vector")
+
+    if pa.types.is_fixed_size_list(array.type):
+        values = array.values.to_numpy(zero_copy_only=False)
+        matrix = values.reshape(len(array), array.type.list_size)
+        return _coerce_float_matrix(matrix, column=column)
+
+    values = array.to_pylist()
+    return _coerce_float_matrix(np.asarray(values), column=column)
 
 
 def _as_numpy(array_like) -> np.ndarray:
@@ -141,6 +184,195 @@ def _sample_training_table(
         return trainset.slice(0, min(train_rows, len(trainset)))
 
     return dataset.to_table(columns=[column], filter=filt, limit=train_rows)
+
+
+def _normalize_metric(metric_type: str) -> str:
+    return _normalize_metric_type(metric_type).lower()
+
+
+def _backend_asarray(array_like, xp):
+    if xp is np:
+        return np.asarray(array_like)
+    return xp.asarray(array_like)
+
+
+def _backend_to_numpy(array_like, xp) -> np.ndarray:
+    if xp is np:
+        return np.asarray(array_like)
+    return xp.asnumpy(array_like)
+
+
+def _normalize_rows(matrix, xp):
+    eps = xp.finfo(matrix.dtype).eps
+    norms = xp.linalg.norm(matrix, axis=1, keepdims=True)
+    return matrix / xp.maximum(norms, eps)
+
+
+def _argmin_distance(vectors, centroids, metric_type: str, xp):
+    if vectors.shape[0] == 0:
+        return xp.empty((0,), dtype=xp.int32)
+
+    metric_type = _normalize_metric(metric_type)
+    if metric_type in {"l2", "euclidean"}:
+        vec_norms = xp.sum(vectors * vectors, axis=1, keepdims=True)
+        ctr_norms = xp.sum(centroids * centroids, axis=1, keepdims=False)
+        distances = vec_norms + ctr_norms - 2 * vectors @ centroids.T
+        return xp.argmin(distances, axis=1).astype(xp.int32, copy=False)
+
+    if metric_type == "dot":
+        scores = vectors @ centroids.T
+        return xp.argmax(scores, axis=1).astype(xp.int32, copy=False)
+
+    if metric_type == "cosine":
+        scores = _normalize_rows(vectors, xp) @ _normalize_rows(centroids, xp).T
+        return xp.argmax(scores, axis=1).astype(xp.int32, copy=False)
+
+    raise ValueError(f"Metric '{metric_type}' is not supported by cuVS IVF_PQ")
+
+
+def _encode_pq_codes(residuals, pq_codebook, metric_type: str, xp) -> np.ndarray:
+    num_rows, num_sub_vectors, _ = residuals.shape
+    codes = np.empty((num_rows, num_sub_vectors), dtype=np.uint8)
+    for subvector_idx in range(num_sub_vectors):
+        sub_vectors = residuals[:, subvector_idx, :]
+        sub_codebook = pq_codebook[subvector_idx]
+        nearest = _argmin_distance(sub_vectors, sub_codebook, metric_type, xp)
+        codes[:, subvector_idx] = _backend_to_numpy(nearest, xp).astype(
+            np.uint8, copy=False
+        )
+    return codes
+
+
+def _make_shuffle_batch(
+    row_ids: np.ndarray,
+    partitions: np.ndarray,
+    pq_codes: np.ndarray,
+    num_sub_vectors: int,
+) -> pa.RecordBatch:
+    pq_values = pa.array(pq_codes.reshape(-1))
+    pq_code_array = pa.FixedSizeListArray.from_arrays(pq_values, num_sub_vectors)
+    return pa.RecordBatch.from_arrays(
+        [
+            pa.array(row_ids, type=pa.uint64()),
+            pa.array(partitions, type=pa.uint32()),
+            pq_code_array,
+        ],
+        schema=pa.schema(
+            [
+                pa.field("row_id", pa.uint64()),
+                pa.field("__ivf_part_id", pa.uint32()),
+                pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
+            ]
+        ),
+    )
+
+
+def one_pass_assign_ivf_pq_on_cuvs(
+    dataset,
+    column: str,
+    metric_type: str,
+    accelerator: str,
+    ivf_centroids: np.ndarray,
+    pq_codebook: np.ndarray,
+    dst_dataset_uri: str | Path | None = None,
+    batch_size: int = 1024 * 10 * 4,
+    *,
+    filter_nan: bool = True,
+):
+    if accelerator != "cuvs":
+        raise ValueError("cuVS acceleration only supports accelerator='cuvs'")
+
+    num_rows = dataset.count_rows()
+    if dataset.schema.field(column).nullable and filter_nan:
+        filt = f"{column} is not null"
+    else:
+        filt = None
+
+    num_sub_vectors = pq_codebook.shape[0]
+    subvector_size = pq_codebook.shape[2]
+    dim = ivf_centroids.shape[1]
+    if dim != num_sub_vectors * subvector_size:
+        raise ValueError(
+            "cuVS returned incompatible IVF/PQ dimensions: "
+            f"centroids dim {dim} != {num_sub_vectors} * {subvector_size}"
+        )
+
+    xp = _xp_module()
+    backend_centroids = _backend_asarray(ivf_centroids, xp)
+    backend_codebook = _backend_asarray(pq_codebook, xp)
+
+    progress = _make_progress(num_rows)
+    progress.set_description("Assigning partitions and computing pq codes")
+
+    def _partition_and_pq_codes_assignment() -> Iterator[pa.RecordBatch]:
+        for batch in dataset.to_batches(
+            columns=[column],
+            filter=filt,
+            with_row_id=True,
+            batch_size=batch_size,
+        ):
+            vectors = _column_to_numpy(batch, column)
+            row_ids = batch.column("_rowid").to_numpy()
+            valid_mask = np.isfinite(vectors).all(axis=1)
+            if not np.all(valid_mask):
+                LOGGER.warning(
+                    "%s vectors are ignored during partition assignment",
+                    len(valid_mask) - int(valid_mask.sum()),
+                )
+                row_ids = row_ids[valid_mask]
+                vectors = vectors[valid_mask]
+            if len(row_ids) == 0:
+                continue
+            backend_vectors = _backend_asarray(vectors, xp)
+
+            partitions = _argmin_distance(
+                backend_vectors, backend_centroids, metric_type, xp
+            )
+            selected_centroids = backend_centroids[partitions]
+            residuals = backend_vectors - selected_centroids
+            residuals = residuals.reshape(-1, num_sub_vectors, subvector_size)
+            pq_codes = _encode_pq_codes(residuals, backend_codebook, metric_type, xp)
+
+            partition_batch = _make_shuffle_batch(
+                row_ids,
+                _backend_to_numpy(partitions, xp),
+                pq_codes,
+                num_sub_vectors,
+            )
+            progress.update(partition_batch.num_rows)
+            yield partition_batch
+
+    output_schema = pa.schema(
+        [
+            pa.field("row_id", pa.uint64()),
+            pa.field("__ivf_part_id", pa.uint32()),
+            pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
+        ]
+    )
+    rbr = pa.RecordBatchReader.from_batches(
+        output_schema, _partition_and_pq_codes_assignment()
+    )
+    if dst_dataset_uri is None:
+        dst_dataset_uri = tempfile.mkdtemp()
+        if re.search(r".:\\", dst_dataset_uri) is not None:
+            dst_dataset_uri = dst_dataset_uri.replace("\\", "/", 1)
+
+    from . import write_dataset
+
+    ds = write_dataset(
+        rbr,
+        dst_dataset_uri,
+        schema=output_schema,
+        data_storage_version="legacy",
+    )
+
+    progress.close()
+    LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
+
+    shuffle_buffers = [
+        data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
+    ]
+    return str(dst_dataset_uri), shuffle_buffers
 
 
 def train_ivf_pq_on_cuvs(
