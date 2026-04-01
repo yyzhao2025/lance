@@ -127,7 +127,9 @@ def _estimate_trainset_fraction(
     return min(1.0, desired_rows / num_rows)
 
 
-def _sample_training_table(dataset, column: str, train_rows: int, filt: str | None) -> pa.Table:
+def _sample_training_table(
+    dataset, column: str, train_rows: int, filt: str | None
+) -> pa.Table:
     if filt is None:
         return dataset.sample(train_rows, columns=[column], randomize_order=True)
 
