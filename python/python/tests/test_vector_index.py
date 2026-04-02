@@ -743,6 +743,43 @@ def test_train_ivf_pq_on_cuvs_nullable_vectors(tmp_path, monkeypatch):
     assert pq_codebook.shape == (4, 256, 4)
 
 
+def test_train_ivf_pq_on_cuvs_uses_subvector_dimension_for_pq_dim(
+    tmp_path, monkeypatch
+):
+    dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path)
+    calls = {}
+
+    class FakeIndex:
+        centers = np.random.randn(4, 16).astype(np.float32)
+        pq_centers = np.random.randn(2, 256, 8).astype(np.float32)
+
+    class FakeIvfPqModule:
+        class IndexParams:
+            def __init__(self, **kwargs):
+                calls.update(kwargs)
+
+        @staticmethod
+        def build(build_params, matrix):
+            assert matrix.shape[1] == 16
+            return FakeIndex()
+
+    monkeypatch.setattr(lance_cuvs, "_require_cuvs", lambda: FakeIvfPqModule())
+
+    centroids, pq_codebook = lance_cuvs.train_ivf_pq_on_cuvs(
+        dataset,
+        "vector",
+        4,
+        "l2",
+        "cuvs",
+        2,
+        sample_rate=4,
+    )
+
+    assert calls["pq_dim"] == 8
+    assert centroids.shape == (4, 16)
+    assert pq_codebook.shape == (2, 256, 8)
+
+
 def test_cuvs_as_numpy_prefers_copy_to_host():
     class FakeDeviceTensor:
         def copy_to_host(self):

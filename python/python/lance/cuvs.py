@@ -349,7 +349,7 @@ def _train_ivf_pq_index_on_cuvs(
             matrix.shape[0], num_partitions, sample_rate
         ),
         pq_bits=num_bits,
-        pq_dim=num_sub_vectors,
+        pq_dim=dimension // num_sub_vectors,
         codebook_kind="subspace",
         force_random_rotation=False,
         add_data_on_build=False,
