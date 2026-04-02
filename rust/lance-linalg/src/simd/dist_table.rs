@@ -87,7 +87,7 @@ pub fn accumulate_4bit_packed_block(block: &[u8], dist_table: &[u8], dists: &mut
             }
         },
         #[cfg(target_arch = "x86_64")]
-        SimdSupport::Avx2 => unsafe { accumulate_4bit_packed_block_avx2(block, dist_table, dists) },
+        SimdSupport::Avx2 => accumulate_4bit_packed_block_scalar(block, dist_table, dists),
         _ => accumulate_4bit_packed_block_scalar(block, dist_table, dists),
     }
 }
@@ -210,46 +210,6 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dis
     );
 
     _mm256_storeu_si256(dists.as_mut_ptr().add(16) as *mut __m256i, dis1);
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-#[inline]
-unsafe fn accumulate_4bit_packed_block_avx2(block: &[u8], dist_table: &[u8], dists: &mut [u16]) {
-    let c = _mm256_loadu_si256(block.as_ptr() as *const __m256i);
-    let lut_vec = _mm256_loadu_si256(dist_table.as_ptr() as *const __m256i);
-    let low_mask = _mm256_set1_epi8(0x0f);
-
-    let lo = _mm256_and_si256(c, low_mask);
-    let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
-
-    let res_lo = _mm256_shuffle_epi8(lut_vec, lo);
-    let res_hi = _mm256_shuffle_epi8(lut_vec, hi);
-
-    let accu0 = res_lo;
-    let accu1 = _mm256_srli_epi16(res_lo, 8);
-    let accu2 = res_hi;
-    let accu3 = _mm256_srli_epi16(res_hi, 8);
-
-    let merged_lo = _mm256_sub_epi16(accu0, _mm256_slli_epi16(accu1, 8));
-    let dis0 = _mm256_add_epi16(
-        _mm256_permute2f128_si256(merged_lo, accu1, 0x21),
-        _mm256_blend_epi32(merged_lo, accu1, 0xF0),
-    );
-
-    let merged_hi = _mm256_sub_epi16(accu2, _mm256_slli_epi16(accu3, 8));
-    let dis1 = _mm256_add_epi16(
-        _mm256_permute2f128_si256(merged_hi, accu3, 0x21),
-        _mm256_blend_epi32(merged_hi, accu3, 0xF0),
-    );
-
-    let mut tmp = [0u16; BATCH_SIZE];
-    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, dis0);
-    _mm256_storeu_si256(tmp.as_mut_ptr().add(16) as *mut __m256i, dis1);
-
-    for (dist, delta) in dists.iter_mut().zip(tmp) {
-        *dist = dist.saturating_add(delta);
-    }
 }
 
 // We implement the AVX512 version in C because AVX512 is not stable yet in Rust,
