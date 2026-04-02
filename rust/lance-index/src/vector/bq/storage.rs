@@ -286,123 +286,9 @@ impl<'a> RabitDistCalculator<'a> {
             return (Vec::new(), stats);
         }
 
-        if self.scale_factors.iter().any(|scale| *scale > 0.0) {
-            stats.fallback_full_scan = true;
-            stats.searched_rows = num_vectors;
-            return (topk_from_distances(row_ids, self.distance_all(k), k), stats);
-        }
-        debug_assert!(
-            self.scale_factors.iter().all(|scale| *scale <= 0.0),
-            "RQ top-k pruning requires non-positive scale factors",
-        );
-
-        let mut max_dist_per_byte = vec![0.0f32; code_len];
-        for (byte_idx, max_value) in max_dist_per_byte.iter_mut().enumerate() {
-            let table_offset = byte_idx * 2 * SEGMENT_NUM_CODES;
-            let current_max = self.dist_table[table_offset..table_offset + SEGMENT_NUM_CODES]
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            let next_max = self.dist_table
-                [table_offset + SEGMENT_NUM_CODES..table_offset + 2 * SEGMENT_NUM_CODES]
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
-            *max_value = current_max + next_max;
-        }
-
-        let mut suffix_max_dist = vec![0.0f32; code_len + 1];
-        for byte_idx in (0..code_len).rev() {
-            suffix_max_dist[byte_idx] = suffix_max_dist[byte_idx + 1] + max_dist_per_byte[byte_idx];
-        }
-
-        let remainder = num_vectors % BATCH_SIZE;
-        let packed_num_vectors = num_vectors - remainder;
-        let mut results: BinaryHeap<OrderedNode<u64>> =
-            BinaryHeap::with_capacity(k.min(num_vectors));
-
-        for batch_offset in (0..packed_num_vectors).step_by(BATCH_SIZE) {
-            let batch_codes = (0..BATCH_SIZE)
-                .map(|lane| {
-                    get_rq_code(self.codes, batch_offset + lane, num_vectors, code_len)
-                        .collect_vec()
-                })
-                .collect_vec();
-            let mut partial_dists = [0.0f32; BATCH_SIZE];
-            let mut should_skip_batch = false;
-
-            for byte_idx in 0..code_len {
-                let dist_table_offset = byte_idx * 2 * SEGMENT_NUM_CODES;
-                let current_dist_table =
-                    &self.dist_table[dist_table_offset..dist_table_offset + SEGMENT_NUM_CODES];
-                let next_dist_table = &self.dist_table[dist_table_offset + SEGMENT_NUM_CODES
-                    ..dist_table_offset + 2 * SEGMENT_NUM_CODES];
-                for (lane, code) in batch_codes.iter().enumerate() {
-                    let code_byte = code[byte_idx];
-                    partial_dists[lane] += current_dist_table[(code_byte & 0x0F) as usize]
-                        + next_dist_table[(code_byte >> 4) as usize];
-                }
-
-                if results.len() == k {
-                    let remaining_dist = suffix_max_dist[byte_idx + 1];
-                    let batch_lower_bound = partial_dists
-                        .iter()
-                        .enumerate()
-                        .map(|(lane, partial_dist)| {
-                            let id = batch_offset + lane;
-                            self.finalize_distance(id, *partial_dist + remaining_dist)
-                        })
-                        .fold(f32::INFINITY, f32::min);
-
-                    if batch_lower_bound > results.peek().unwrap().dist.0 {
-                        stats.pruned_batches += 1;
-                        stats.pruned_rows += BATCH_SIZE;
-                        should_skip_batch = true;
-                        break;
-                    }
-                }
-            }
-
-            if should_skip_batch {
-                continue;
-            }
-
-            stats.searched_rows += BATCH_SIZE;
-
-            for (lane, dist) in partial_dists.into_iter().enumerate() {
-                let id = batch_offset + lane;
-                push_topk_result(
-                    &mut results,
-                    OrderedNode::new(row_ids[id], OrderedFloat(self.finalize_distance(id, dist))),
-                    k,
-                );
-            }
-        }
-
-        if remainder > 0 {
-            let mut remainder_distances = vec![0.0; num_vectors];
-            compute_rq_distance_flat(
-                &self.dist_table,
-                self.codes,
-                packed_num_vectors,
-                remainder,
-                &mut remainder_distances,
-            );
-            for (id, dist) in remainder_distances
-                .into_iter()
-                .enumerate()
-                .skip(packed_num_vectors)
-            {
-                push_topk_result(
-                    &mut results,
-                    OrderedNode::new(row_ids[id], OrderedFloat(self.finalize_distance(id, dist))),
-                    k,
-                );
-            }
-            stats.searched_rows += remainder;
-        }
-
-        (results.into_iter().collect(), stats)
+        stats.fallback_full_scan = true;
+        stats.searched_rows = num_vectors;
+        (topk_from_distances(row_ids, self.distance_all(k), k), stats)
     }
 }
 
@@ -1241,6 +1127,14 @@ mod tests {
         canonicalize_topk(heap.into_iter().collect())
     }
 
+    fn baseline_topk_distance_all(
+        dist_calc: &RabitDistCalculator,
+        row_ids: &[u64],
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        canonicalize_topk(topk_from_distances(row_ids, dist_calc.distance_all(k), k))
+    }
+
     #[test]
     fn test_try_from_batch_canonicalizes_rq_codes_to_packed_layout() {
         let original_codes = make_test_codes(50, 64);
@@ -1334,7 +1228,7 @@ mod tests {
             let dist_calc = storage.dist_calculator(query, 0.0);
 
             for &k in &[1, 10, 32] {
-                let expected = baseline_topk(&dist_calc, storage.row_ids.values(), k);
+                let expected = baseline_topk_distance_all(&dist_calc, storage.row_ids.values(), k);
                 let actual = canonicalize_topk(
                     dist_calc.search_topk_unfiltered(storage.row_ids.values(), k),
                 );
@@ -1352,7 +1246,7 @@ mod tests {
             let dist_calc = storage.dist_calculator(query, 0.0);
 
             for &k in &[1, 10, 32] {
-                let expected = baseline_topk(&dist_calc, storage.row_ids.values(), k);
+                let expected = baseline_topk_distance_all(&dist_calc, storage.row_ids.values(), k);
                 let actual = canonicalize_topk(
                     dist_calc.search_topk_unfiltered(storage.row_ids.values(), k),
                 );
@@ -1390,13 +1284,13 @@ mod tests {
         let (actual, stats) = dist_calc.search_topk_unfiltered_with_stats(&row_ids, 10);
         assert_eq!(
             canonicalize_topk(actual),
-            baseline_topk(&dist_calc, &row_ids, 10)
+            baseline_topk_distance_all(&dist_calc, &row_ids, 10)
         );
-        assert!(!stats.fallback_full_scan);
+        assert!(stats.fallback_full_scan);
     }
 
     #[test]
-    fn test_search_topk_reports_pruned_batches() {
+    fn test_search_topk_reports_zero_pruned_rows() {
         let row_ids = (0..96u64).collect::<Vec<_>>();
         let code_len = 8;
         let mut codes = vec![0xFF; 32 * code_len];
@@ -1418,10 +1312,10 @@ mod tests {
         );
 
         let (_results, stats) = dist_calc.search_topk_unfiltered_with_stats(&row_ids, 1);
-        assert_eq!(stats.searched_rows, 32);
-        assert_eq!(stats.pruned_rows, 64);
-        assert!(stats.pruned_batches > 0);
-        assert!(!stats.fallback_full_scan);
+        assert_eq!(stats.searched_rows, row_ids.len());
+        assert_eq!(stats.pruned_rows, 0);
+        assert_eq!(stats.pruned_batches, 0);
+        assert!(stats.fallback_full_scan);
     }
 
     #[test]
@@ -1452,7 +1346,7 @@ mod tests {
         assert_eq!(stats.pruned_rows, 0);
         assert_eq!(
             canonicalize_topk(actual),
-            baseline_topk(&dist_calc, &row_ids, 10)
+            baseline_topk_distance_all(&dist_calc, &row_ids, 10)
         );
     }
 }
