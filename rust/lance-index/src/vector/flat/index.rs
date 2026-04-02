@@ -21,6 +21,7 @@ use crate::{
     prefilter::PreFilter,
     vector::{
         DIST_COL, Query,
+        bq::storage::RabitQuantizationStorage,
         graph::OrderedNode,
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
         storage::{DistCalculator, VectorStore},
@@ -89,9 +90,26 @@ impl IvfSubIndex for FlatIndex {
     ) -> Result<RecordBatch> {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
-        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
         let mut res = BinaryHeap::with_capacity(k);
         metrics.record_comparisons(storage.len());
+
+        if !is_range_query
+            && prefilter.is_empty()
+            && let Some(rq_storage) = storage.as_any().downcast_ref::<RabitQuantizationStorage>()
+        {
+            let dist_calc = rq_storage.dist_calculator(query, params.dist_q_c);
+            let results = dist_calc.search_topk_unfiltered(rq_storage.row_ids_slice(), k);
+            let (row_ids, dists): (Vec<_>, Vec<_>) =
+                results.into_iter().map(|r| (r.id, r.dist.0)).unzip();
+            let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
+
+            return Ok(RecordBatch::try_new(
+                ANN_SEARCH_SCHEMA.clone(),
+                vec![Arc::new(dists), Arc::new(row_ids)],
+            )?);
+        }
+
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
 
         match prefilter.is_empty() {
             true => {
@@ -376,5 +394,235 @@ impl TryFrom<Quantizer> for FlatBinQuantizer {
             Quantizer::FlatBin(quantizer) => Ok(quantizer),
             _ => Err(Error::invalid_input("quantizer is not FlatBinQuantizer")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
+    use async_trait::async_trait;
+    use lance_arrow::FixedSizeListArrayExt;
+    use lance_core::utils::mask::RowAddrMask;
+    use lance_core::{ROW_ID, Result};
+    use lance_linalg::distance::DistanceType;
+
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::prefilter::{NoFilter, PreFilter};
+    use crate::vector::bq::storage::{RABIT_CODE_COLUMN, RabitQuantizationStorage};
+    use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
+    use crate::vector::bq::{RQRotationType, builder::RabitQuantizer};
+    use crate::vector::quantizer::{Quantization, QuantizerStorage};
+    use crate::vector::storage::{DistCalculator, VectorStore};
+    use crate::vector::v3::subindex::IvfSubIndex;
+
+    use super::{FlatIndex, FlatQueryParams};
+
+    struct PassAllFilter;
+
+    #[async_trait]
+    impl PreFilter for PassAllFilter {
+        async fn wait_for_ready(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn is_empty(&self) -> bool {
+            false
+        }
+
+        fn mask(&self) -> Arc<RowAddrMask> {
+            Arc::new(RowAddrMask::all_rows())
+        }
+
+        fn filter_row_ids<'a>(&self, row_ids: Box<dyn Iterator<Item = &'a u64> + 'a>) -> Vec<u64> {
+            row_ids.enumerate().map(|(idx, _)| idx as u64).collect()
+        }
+    }
+
+    fn make_rq_storage(num_rows: usize) -> (RabitQuantizationStorage, ArrayRef) {
+        let code_dim = 64;
+        let quantizer = RabitQuantizer::new_with_rotation::<arrow::datatypes::Float32Type>(
+            1,
+            code_dim,
+            RQRotationType::Fast,
+        );
+        let values = Float32Array::from_iter_values(
+            (0..num_rows * code_dim as usize).map(|idx| idx as f32 / 17.0),
+        );
+        let vectors = FixedSizeListArray::try_new_from_values(values, code_dim).unwrap();
+        let codes = quantizer
+            .quantize(&vectors)
+            .unwrap()
+            .as_fixed_size_list()
+            .clone();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                ROW_ID,
+                Arc::new(UInt64Array::from_iter_values(0..num_rows as u64)) as ArrayRef,
+            ),
+            (RABIT_CODE_COLUMN, Arc::new(codes) as ArrayRef),
+            (
+                ADD_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|idx| idx as f32 * 0.01),
+                )) as ArrayRef,
+            ),
+            (
+                SCALE_FACTORS_COLUMN,
+                Arc::new(Float32Array::from_iter_values(
+                    (0..num_rows).map(|idx| -(1.0 + idx as f32 * 0.01)),
+                )) as ArrayRef,
+            ),
+        ])
+        .unwrap();
+        let storage = RabitQuantizationStorage::try_from_batch(
+            batch,
+            &quantizer.metadata(None),
+            DistanceType::L2,
+            None,
+        )
+        .unwrap();
+        let query: ArrayRef = Arc::new(Float32Array::from_iter_values(
+            (0..code_dim).map(|idx| idx as f32 / 23.0),
+        ));
+        (storage, query)
+    }
+
+    fn sort_result_batch(batch: &RecordBatch) -> Vec<(u64, f32)> {
+        let row_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values();
+        let distances = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap()
+            .values();
+        let mut pairs = row_ids
+            .iter()
+            .copied()
+            .zip(distances.iter().copied())
+            .collect::<Vec<_>>();
+        pairs.sort_by(|(lhs_id, lhs_dist), (rhs_id, rhs_dist)| {
+            lhs_dist
+                .total_cmp(rhs_dist)
+                .then_with(|| lhs_id.cmp(rhs_id))
+        });
+        pairs
+    }
+
+    #[test]
+    fn test_rq_flat_search_matches_full_scan_without_filter() {
+        let (storage, query) = make_rq_storage(96);
+        let index = FlatIndex::default();
+        let metrics = NoOpMetricsCollector;
+        let params = FlatQueryParams::default();
+
+        let result = index
+            .search(
+                query.clone(),
+                10,
+                params,
+                &storage,
+                Arc::new(NoFilter),
+                &metrics,
+            )
+            .unwrap();
+
+        let baseline = {
+            let dist_calc = storage.dist_calculator(query, 0.0);
+            let mut pairs = storage
+                .row_ids_slice()
+                .iter()
+                .copied()
+                .zip(dist_calc.distance_all(10))
+                .collect::<Vec<_>>();
+            pairs.sort_by(|(lhs_id, lhs_dist), (rhs_id, rhs_dist)| {
+                lhs_dist
+                    .total_cmp(rhs_dist)
+                    .then_with(|| lhs_id.cmp(rhs_id))
+            });
+            pairs.truncate(10);
+            pairs
+        };
+
+        assert_eq!(sort_result_batch(&result), baseline);
+    }
+
+    #[test]
+    fn test_rq_flat_range_query_matches_scalar_path() {
+        let (storage, query) = make_rq_storage(64);
+        let index = FlatIndex::default();
+        let metrics = NoOpMetricsCollector;
+        let params = FlatQueryParams {
+            lower_bound: Some(-1000.0),
+            upper_bound: Some(1000.0),
+            dist_q_c: 0.0,
+        };
+
+        let result = index
+            .search(
+                query.clone(),
+                8,
+                params,
+                &storage,
+                Arc::new(NoFilter),
+                &metrics,
+            )
+            .unwrap();
+
+        let dist_calc = storage.dist_calculator(query, 0.0);
+        let mut baseline = storage
+            .row_ids_slice()
+            .iter()
+            .copied()
+            .zip(dist_calc.distance_all(8))
+            .collect::<Vec<_>>();
+        baseline.sort_by(|(lhs_id, lhs_dist), (rhs_id, rhs_dist)| {
+            lhs_dist
+                .total_cmp(rhs_dist)
+                .then_with(|| lhs_id.cmp(rhs_id))
+        });
+        baseline.truncate(8);
+
+        assert_eq!(sort_result_batch(&result), baseline);
+    }
+
+    #[test]
+    fn test_rq_flat_prefilter_matches_scalar_path() {
+        let (storage, query) = make_rq_storage(64);
+        let index = FlatIndex::default();
+        let metrics = NoOpMetricsCollector;
+
+        let result = index
+            .search(
+                query.clone(),
+                8,
+                FlatQueryParams::default(),
+                &storage,
+                Arc::new(PassAllFilter),
+                &metrics,
+            )
+            .unwrap();
+
+        let dist_calc = storage.dist_calculator(query, 0.0);
+        let mut baseline = storage
+            .row_ids()
+            .enumerate()
+            .map(|(idx, row_id)| (*row_id, dist_calc.distance(idx as u32)))
+            .collect::<Vec<_>>();
+        baseline.sort_by(|(lhs_id, lhs_dist), (rhs_id, rhs_dist)| {
+            lhs_dist
+                .total_cmp(rhs_dist)
+                .then_with(|| lhs_id.cmp(rhs_id))
+        });
+        baseline.truncate(8);
+
+        assert_eq!(sort_result_batch(&result), baseline);
     }
 }

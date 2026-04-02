@@ -61,6 +61,37 @@ pub fn sum_4bit_dist_table(
     }
 }
 
+/// Accumulate one packed 32-row 4-bit block into `dists`.
+///
+/// `block` is the packed code bytes for one sub-vector byte position across 32 rows.
+/// `dist_table` contains the 16-entry LUT for the low nibble followed by the 16-entry
+/// LUT for the high nibble.
+#[inline]
+pub fn accumulate_4bit_packed_block(block: &[u8], dist_table: &[u8], dists: &mut [u16]) {
+    debug_assert_eq!(block.len(), BATCH_SIZE);
+    debug_assert_eq!(dist_table.len(), BATCH_SIZE);
+    debug_assert_eq!(dists.len(), BATCH_SIZE);
+
+    match *SIMD_SUPPORT {
+        #[cfg(all(kernel_support = "avx512", target_arch = "x86_64"))]
+        SimdSupport::Avx512 | SimdSupport::Avx512FP16 => unsafe {
+            let mut tmp = [0u16; BATCH_SIZE];
+            sum_4bit_dist_table_32bytes_batch_avx512(
+                block.as_ptr(),
+                block.len(),
+                dist_table.as_ptr(),
+                tmp.as_mut_ptr(),
+            );
+            for (dist, delta) in dists.iter_mut().zip(tmp) {
+                *dist = dist.saturating_add(delta);
+            }
+        },
+        #[cfg(target_arch = "x86_64")]
+        SimdSupport::Avx2 => unsafe { accumulate_4bit_packed_block_avx2(block, dist_table, dists) },
+        _ => accumulate_4bit_packed_block_scalar(block, dist_table, dists),
+    }
+}
+
 #[inline]
 #[allow(unused)]
 fn sum_4bit_dist_table_scalar(code_len: usize, codes: &[u8], dist_table: &[u8], dists: &mut [u16]) {
@@ -86,6 +117,28 @@ fn sum_4bit_dist_table_scalar(code_len: usize, codes: &[u8], dist_table: &[u8], 
                     .saturating_add(next_dist_table[high_next_code] as u16);
             }
         }
+    }
+}
+
+#[inline]
+fn accumulate_4bit_packed_block_scalar(block: &[u8], dist_table: &[u8], dists: &mut [u16]) {
+    let current_dist_table = &dist_table[..16];
+    let next_dist_table = &dist_table[16..];
+
+    for j in 0..16 {
+        let low_current_code = (block[j] & 0x0F) as usize;
+        let high_current_code = (block[j] >> 4) as usize;
+        let low_next_code = (block[j + 16] & 0x0F) as usize;
+        let high_next_code = (block[j + 16] >> 4) as usize;
+
+        let lower_id = PERM0[j];
+        let higher_id = PERM0[j] + 16;
+        dists[lower_id] = dists[lower_id]
+            .saturating_add(current_dist_table[low_current_code] as u16)
+            .saturating_add(next_dist_table[low_next_code] as u16);
+        dists[higher_id] = dists[higher_id]
+            .saturating_add(current_dist_table[high_current_code] as u16)
+            .saturating_add(next_dist_table[high_next_code] as u16);
     }
 }
 
@@ -157,6 +210,46 @@ unsafe fn sum_dist_table_32bytes_batch_avx2(codes: &[u8], dist_table: &[u8], dis
     );
 
     _mm256_storeu_si256(dists.as_mut_ptr().add(16) as *mut __m256i, dis1);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn accumulate_4bit_packed_block_avx2(block: &[u8], dist_table: &[u8], dists: &mut [u16]) {
+    let c = _mm256_loadu_si256(block.as_ptr() as *const __m256i);
+    let lut_vec = _mm256_loadu_si256(dist_table.as_ptr() as *const __m256i);
+    let low_mask = _mm256_set1_epi8(0x0f);
+
+    let lo = _mm256_and_si256(c, low_mask);
+    let hi = _mm256_and_si256(_mm256_srli_epi16(c, 4), low_mask);
+
+    let res_lo = _mm256_shuffle_epi8(lut_vec, lo);
+    let res_hi = _mm256_shuffle_epi8(lut_vec, hi);
+
+    let accu0 = res_lo;
+    let accu1 = _mm256_srli_epi16(res_lo, 8);
+    let accu2 = res_hi;
+    let accu3 = _mm256_srli_epi16(res_hi, 8);
+
+    let merged_lo = _mm256_sub_epi16(accu0, _mm256_slli_epi16(accu1, 8));
+    let dis0 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(merged_lo, accu1, 0x21),
+        _mm256_blend_epi32(merged_lo, accu1, 0xF0),
+    );
+
+    let merged_hi = _mm256_sub_epi16(accu2, _mm256_slli_epi16(accu3, 8));
+    let dis1 = _mm256_add_epi16(
+        _mm256_permute2f128_si256(merged_hi, accu3, 0x21),
+        _mm256_blend_epi32(merged_hi, accu3, 0xF0),
+    );
+
+    let mut tmp = [0u16; BATCH_SIZE];
+    _mm256_storeu_si256(tmp.as_mut_ptr() as *mut __m256i, dis0);
+    _mm256_storeu_si256(tmp.as_mut_ptr().add(16) as *mut __m256i, dis1);
+
+    for (dist, delta) in dists.iter_mut().zip(tmp) {
+        *dist = dist.saturating_add(delta);
+    }
 }
 
 // We implement the AVX512 version in C because AVX512 is not stable yet in Rust,
