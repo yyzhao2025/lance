@@ -296,32 +296,24 @@ impl<'a> RabitDistCalculator<'a> {
             "RQ top-k pruning requires non-positive scale factors",
         );
 
-        let (qmin, qmax, quantized_dists_table) = quantize_dist_table(&self.dist_table);
-        let range = (qmax - qmin) / 255.0;
-        let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
-        let sum_min = num_tables as f32 * qmin;
-
-        let mut max_quantized_per_byte = vec![0u32; code_len];
-        for (byte_idx, max_value) in max_quantized_per_byte.iter_mut().enumerate() {
+        let mut max_dist_per_byte = vec![0.0f32; code_len];
+        for (byte_idx, max_value) in max_dist_per_byte.iter_mut().enumerate() {
             let table_offset = byte_idx * 2 * SEGMENT_NUM_CODES;
-            let current_max = quantized_dists_table[table_offset..table_offset + SEGMENT_NUM_CODES]
+            let current_max = self.dist_table[table_offset..table_offset + SEGMENT_NUM_CODES]
                 .iter()
                 .copied()
-                .max()
-                .unwrap_or_default();
-            let next_max = quantized_dists_table
+                .fold(f32::NEG_INFINITY, f32::max);
+            let next_max = self.dist_table
                 [table_offset + SEGMENT_NUM_CODES..table_offset + 2 * SEGMENT_NUM_CODES]
                 .iter()
                 .copied()
-                .max()
-                .unwrap_or_default();
-            *max_value = u32::from(current_max) + u32::from(next_max);
+                .fold(f32::NEG_INFINITY, f32::max);
+            *max_value = current_max + next_max;
         }
 
-        let mut suffix_max_quantized = vec![0u32; code_len + 1];
+        let mut suffix_max_dist = vec![0.0f32; code_len + 1];
         for byte_idx in (0..code_len).rev() {
-            suffix_max_quantized[byte_idx] =
-                suffix_max_quantized[byte_idx + 1] + max_quantized_per_byte[byte_idx];
+            suffix_max_dist[byte_idx] = suffix_max_dist[byte_idx + 1] + max_dist_per_byte[byte_idx];
         }
 
         let remainder = num_vectors % BATCH_SIZE;
@@ -330,38 +322,35 @@ impl<'a> RabitDistCalculator<'a> {
             BinaryHeap::with_capacity(k.min(num_vectors));
 
         for batch_offset in (0..packed_num_vectors).step_by(BATCH_SIZE) {
-            let packed_batch =
-                &self.codes[batch_offset * code_len..(batch_offset + BATCH_SIZE) * code_len];
-            let mut quantized_sums = [0u32; BATCH_SIZE];
-            let mut quantized_deltas = [0u16; BATCH_SIZE];
+            let batch_codes = (0..BATCH_SIZE)
+                .map(|lane| {
+                    get_rq_code(self.codes, batch_offset + lane, num_vectors, code_len)
+                        .collect_vec()
+                })
+                .collect_vec();
+            let mut partial_dists = [0.0f32; BATCH_SIZE];
             let mut should_skip_batch = false;
 
             for byte_idx in 0..code_len {
-                let block_offset = byte_idx * BATCH_SIZE;
-                let packed_block = &packed_batch[block_offset..block_offset + BATCH_SIZE];
                 let dist_table_offset = byte_idx * 2 * SEGMENT_NUM_CODES;
-                let packed_dist_table =
-                    &quantized_dists_table[dist_table_offset..dist_table_offset + BATCH_SIZE];
-                quantized_deltas.fill(0);
-                simd::dist_table::accumulate_4bit_packed_block(
-                    packed_block,
-                    packed_dist_table,
-                    &mut quantized_deltas,
-                );
-                for (sum, delta) in quantized_sums.iter_mut().zip(quantized_deltas) {
-                    *sum += u32::from(delta);
+                let current_dist_table =
+                    &self.dist_table[dist_table_offset..dist_table_offset + SEGMENT_NUM_CODES];
+                let next_dist_table = &self.dist_table[dist_table_offset + SEGMENT_NUM_CODES
+                    ..dist_table_offset + 2 * SEGMENT_NUM_CODES];
+                for (lane, code) in batch_codes.iter().enumerate() {
+                    let code_byte = code[byte_idx];
+                    partial_dists[lane] += current_dist_table[(code_byte & 0x0F) as usize]
+                        + next_dist_table[(code_byte >> 4) as usize];
                 }
 
                 if results.len() == k {
-                    let remaining_quantized = suffix_max_quantized[byte_idx + 1];
-                    let batch_lower_bound = quantized_sums
+                    let remaining_dist = suffix_max_dist[byte_idx + 1];
+                    let batch_lower_bound = partial_dists
                         .iter()
                         .enumerate()
-                        .map(|(lane, partial_sum)| {
+                        .map(|(lane, partial_dist)| {
                             let id = batch_offset + lane;
-                            let dist_upper_bound =
-                                (*partial_sum + remaining_quantized) as f32 * range + sum_min;
-                            self.finalize_distance(id, dist_upper_bound)
+                            self.finalize_distance(id, *partial_dist + remaining_dist)
                         })
                         .fold(f32::INFINITY, f32::min);
 
@@ -380,9 +369,8 @@ impl<'a> RabitDistCalculator<'a> {
 
             stats.searched_rows += BATCH_SIZE;
 
-            for (lane, quantized_sum) in quantized_sums.into_iter().enumerate() {
+            for (lane, dist) in partial_dists.into_iter().enumerate() {
                 let id = batch_offset + lane;
-                let dist = (quantized_sum as f32) * range + sum_min;
                 push_topk_result(
                     &mut results,
                     OrderedNode::new(row_ids[id], OrderedFloat(self.finalize_distance(id, dist))),
@@ -1243,46 +1231,13 @@ mod tests {
         k: usize,
     ) -> Vec<(u64, f32)> {
         let mut heap = BinaryHeap::with_capacity(k.min(row_ids.len()));
-        for (&row_id, dist) in row_ids.iter().zip(dist_calc.distance_all(k)) {
-            push_topk_result(&mut heap, OrderedNode::new(row_id, dist.into()), k);
-        }
-        canonicalize_topk(heap.into_iter().collect())
-    }
-
-    fn quantized_reference_topk(
-        dist_calc: &RabitDistCalculator,
-        row_ids: &[u64],
-        k: usize,
-    ) -> Vec<(u64, f32)> {
-        let (qmin, qmax, quantized_dists_table) = quantize_dist_table(&dist_calc.dist_table);
-        let range = (qmax - qmin) / 255.0;
-        let sum_min = (quantized_dists_table.len() / SEGMENT_NUM_CODES) as f32 * qmin;
-        let code_len = dist_calc.dim * (dist_calc.num_bits as usize) / u8::BITS as usize;
-        let num_vectors = dist_calc.codes.len() / code_len;
-        let mut heap = BinaryHeap::with_capacity(k.min(row_ids.len()));
-
-        for id in 0..num_vectors {
-            let code = get_rq_code(dist_calc.codes, id, num_vectors, code_len);
-            let quantized_sum = code
-                .zip(
-                    quantized_dists_table
-                        .chunks_exact(SEGMENT_NUM_CODES)
-                        .tuples(),
-                )
-                .map(|(code_byte, (dist_table, next_dist_table))| {
-                    let current_code = (code_byte & 0x0F) as usize;
-                    let next_code = (code_byte >> 4) as usize;
-                    u32::from(dist_table[current_code]) + u32::from(next_dist_table[next_code])
-                })
-                .sum::<u32>();
-            let dist = quantized_sum as f32 * range + sum_min;
+        for (id, &row_id) in row_ids.iter().enumerate() {
             push_topk_result(
                 &mut heap,
-                OrderedNode::new(row_ids[id], dist_calc.finalize_distance(id, dist).into()),
+                OrderedNode::new(row_id, dist_calc.distance(id as u32).into()),
                 k,
             );
         }
-
         canonicalize_topk(heap.into_iter().collect())
     }
 
@@ -1407,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_topk_matches_quantized_reference_for_large_codebooks() {
+    fn test_search_topk_matches_exact_reference_for_large_codebooks() {
         let row_ids = (0..64u64).collect::<Vec<_>>();
         let code_len = 192;
         let mut codes = vec![0u8; row_ids.len() * code_len];
@@ -1435,7 +1390,7 @@ mod tests {
         let (actual, stats) = dist_calc.search_topk_unfiltered_with_stats(&row_ids, 10);
         assert_eq!(
             canonicalize_topk(actual),
-            quantized_reference_topk(&dist_calc, &row_ids, 10)
+            baseline_topk(&dist_calc, &row_ids, 10)
         );
         assert!(!stats.fallback_full_scan);
     }
