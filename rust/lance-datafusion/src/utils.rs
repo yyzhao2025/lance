@@ -244,6 +244,7 @@ pub const INDICES_LOADED_METRIC: &str = "indices_loaded";
 pub const PARTS_LOADED_METRIC: &str = "parts_loaded";
 pub const PARTITIONS_RANKED_METRIC: &str = "partitions_ranked";
 pub const INDEX_COMPARISONS_METRIC: &str = "index_comparisons";
+pub const INDEX_PRUNED_ROWS_METRIC: &str = "index_pruned_rows";
 pub const FRAGMENTS_SCANNED_METRIC: &str = "fragments_scanned";
 pub const RANGES_SCANNED_METRIC: &str = "ranges_scanned";
 pub const ROWS_SCANNED_METRIC: &str = "rows_scanned";

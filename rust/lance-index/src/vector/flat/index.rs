@@ -91,14 +91,16 @@ impl IvfSubIndex for FlatIndex {
         let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
         let row_ids = storage.row_ids();
         let mut res = BinaryHeap::with_capacity(k);
-        metrics.record_comparisons(storage.len());
 
         if !is_range_query
             && prefilter.is_empty()
             && let Some(rq_storage) = storage.as_any().downcast_ref::<RabitQuantizationStorage>()
         {
             let dist_calc = rq_storage.dist_calculator(query, params.dist_q_c);
-            let results = dist_calc.search_topk_unfiltered(rq_storage.row_ids_slice(), k);
+            let (results, stats) =
+                dist_calc.search_topk_unfiltered_with_stats(rq_storage.row_ids_slice(), k);
+            metrics.record_comparisons(stats.searched_rows);
+            metrics.record_pruned_rows(stats.pruned_rows);
             let (row_ids, dists): (Vec<_>, Vec<_>) =
                 results.into_iter().map(|r| (r.id, r.dist.0)).unzip();
             let (row_ids, dists) = (UInt64Array::from(row_ids), Float32Array::from(dists));
@@ -113,6 +115,7 @@ impl IvfSubIndex for FlatIndex {
 
         match prefilter.is_empty() {
             true => {
+                metrics.record_comparisons(storage.len());
                 let dists = dist_calc.distance_all(k);
 
                 if is_range_query {
@@ -144,6 +147,7 @@ impl IvfSubIndex for FlatIndex {
                 }
             }
             false => {
+                metrics.record_comparisons(storage.len());
                 let row_addr_mask = prefilter.mask();
                 if is_range_query {
                     let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
@@ -400,6 +404,7 @@ impl TryFrom<Quantizer> for FlatBinQuantizer {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use arrow_array::cast::AsArray;
     use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt64Array};
@@ -409,7 +414,7 @@ mod tests {
     use lance_core::{ROW_ID, Result};
     use lance_linalg::distance::DistanceType;
 
-    use crate::metrics::NoOpMetricsCollector;
+    use crate::metrics::{LocalMetricsCollector, NoOpMetricsCollector};
     use crate::prefilter::{NoFilter, PreFilter};
     use crate::vector::bq::storage::{RABIT_CODE_COLUMN, RabitQuantizationStorage};
     use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
@@ -520,7 +525,7 @@ mod tests {
     fn test_rq_flat_search_matches_full_scan_without_filter() {
         let (storage, query) = make_rq_storage(96);
         let index = FlatIndex::default();
-        let metrics = NoOpMetricsCollector;
+        let metrics = LocalMetricsCollector::default();
         let params = FlatQueryParams::default();
 
         let result = index
@@ -552,6 +557,11 @@ mod tests {
         };
 
         assert_eq!(sort_result_batch(&result), baseline);
+        assert_eq!(
+            metrics.comparisons.load(Ordering::Relaxed)
+                + metrics.pruned_rows.load(Ordering::Relaxed),
+            storage.len()
+        );
     }
 
     #[test]

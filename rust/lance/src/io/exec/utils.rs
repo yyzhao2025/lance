@@ -2,8 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use lance_datafusion::utils::{
-    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC, INDICES_LOADED_METRIC,
-    IOPS_METRIC, PARTS_LOADED_METRIC, REQUESTS_METRIC,
+    BYTES_READ_METRIC, ExecutionPlanMetricsSetExt, INDEX_COMPARISONS_METRIC,
+    INDEX_PRUNED_ROWS_METRIC, INDICES_LOADED_METRIC, IOPS_METRIC, PARTS_LOADED_METRIC,
+    REQUESTS_METRIC,
 };
 use lance_index::metrics::MetricsCollector;
 use lance_io::scheduler::ScanScheduler;
@@ -394,6 +395,7 @@ pub struct IndexMetrics {
     indices_loaded: Count,
     parts_loaded: Count,
     index_comparisons: Count,
+    index_pruned_rows: Count,
 }
 
 impl IndexMetrics {
@@ -402,6 +404,7 @@ impl IndexMetrics {
             indices_loaded: metrics.new_count(INDICES_LOADED_METRIC, partition),
             parts_loaded: metrics.new_count(PARTS_LOADED_METRIC, partition),
             index_comparisons: metrics.new_count(INDEX_COMPARISONS_METRIC, partition),
+            index_pruned_rows: metrics.new_count(INDEX_PRUNED_ROWS_METRIC, partition),
         }
     }
 }
@@ -415,6 +418,10 @@ impl MetricsCollector for IndexMetrics {
     }
     fn record_comparisons(&self, num_comparisons: usize) {
         self.index_comparisons.add(num_comparisons);
+    }
+
+    fn record_pruned_rows(&self, num_rows: usize) {
+        self.index_pruned_rows.add(num_rows);
     }
 }
 

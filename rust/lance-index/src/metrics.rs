@@ -43,6 +43,12 @@ pub trait MetricsCollector: Send + Sync {
     ///
     /// The goal is to provide some visibility into the compute cost of the search
     fn record_comparisons(&self, num_comparisons: usize);
+
+    /// Record the number of rows pruned by an index-specific optimization.
+    ///
+    /// This is intended for debugging and performance analysis. Implementations
+    /// that do not track this metric can ignore it.
+    fn record_pruned_rows(&self, _num_rows: usize) {}
 }
 
 /// A no-op metrics collector that does nothing
@@ -59,6 +65,7 @@ pub struct LocalMetricsCollector {
     pub parts_loaded: AtomicUsize,
     pub index_loads: AtomicUsize,
     pub comparisons: AtomicUsize,
+    pub pruned_rows: AtomicUsize,
 }
 
 impl LocalMetricsCollector {
@@ -66,6 +73,7 @@ impl LocalMetricsCollector {
         other.record_parts_loaded(self.parts_loaded.load(Ordering::Relaxed));
         other.record_index_loads(self.index_loads.load(Ordering::Relaxed));
         other.record_comparisons(self.comparisons.load(Ordering::Relaxed));
+        other.record_pruned_rows(self.pruned_rows.load(Ordering::Relaxed));
     }
 }
 
@@ -81,5 +89,9 @@ impl MetricsCollector for LocalMetricsCollector {
     fn record_comparisons(&self, num_comparisons: usize) {
         self.comparisons
             .fetch_add(num_comparisons, Ordering::Relaxed);
+    }
+
+    fn record_pruned_rows(&self, num_rows: usize) {
+        self.pruned_rows.fetch_add(num_rows, Ordering::Relaxed);
     }
 }

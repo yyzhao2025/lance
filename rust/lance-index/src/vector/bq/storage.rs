@@ -268,7 +268,7 @@ impl<'a> RabitDistCalculator<'a> {
         self.search_topk_unfiltered_with_stats(row_ids, k).0
     }
 
-    fn search_topk_unfiltered_with_stats(
+    pub(crate) fn search_topk_unfiltered_with_stats(
         &self,
         row_ids: &[u64],
         k: usize,
@@ -288,6 +288,7 @@ impl<'a> RabitDistCalculator<'a> {
 
         if self.scale_factors.iter().any(|scale| *scale > 0.0) {
             stats.fallback_full_scan = true;
+            stats.searched_rows = num_vectors;
             return (topk_from_distances(row_ids, self.distance_all(k), k), stats);
         }
         debug_assert!(
@@ -361,6 +362,7 @@ impl<'a> RabitDistCalculator<'a> {
 
                     if batch_lower_bound > results.peek().unwrap().dist.0 {
                         stats.pruned_batches += 1;
+                        stats.pruned_rows += BATCH_SIZE;
                         should_skip_batch = true;
                         break;
                     }
@@ -370,6 +372,8 @@ impl<'a> RabitDistCalculator<'a> {
             if should_skip_batch {
                 continue;
             }
+
+            stats.searched_rows += BATCH_SIZE;
 
             for (lane, quantized_sum) in quantized_sums.into_iter().enumerate() {
                 let id = batch_offset + lane;
@@ -402,6 +406,7 @@ impl<'a> RabitDistCalculator<'a> {
                     k,
                 );
             }
+            stats.searched_rows += remainder;
         }
 
         (results.into_iter().collect(), stats)
@@ -409,9 +414,11 @@ impl<'a> RabitDistCalculator<'a> {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-struct RabitTopKSearchStats {
-    pruned_batches: usize,
-    fallback_full_scan: bool,
+pub(crate) struct RabitTopKSearchStats {
+    pub(crate) searched_rows: usize,
+    pub(crate) pruned_rows: usize,
+    pub(crate) pruned_batches: usize,
+    pub(crate) fallback_full_scan: bool,
 }
 
 #[inline]
@@ -1380,6 +1387,8 @@ mod tests {
         );
 
         let (_results, stats) = dist_calc.search_topk_unfiltered_with_stats(&row_ids, 1);
+        assert_eq!(stats.searched_rows, 32);
+        assert_eq!(stats.pruned_rows, 64);
         assert!(stats.pruned_batches > 0);
         assert!(!stats.fallback_full_scan);
     }
@@ -1408,6 +1417,8 @@ mod tests {
 
         let (actual, stats) = dist_calc.search_topk_unfiltered_with_stats(&row_ids, 10);
         assert!(stats.fallback_full_scan);
+        assert_eq!(stats.searched_rows, row_ids.len());
+        assert_eq!(stats.pruned_rows, 0);
         assert_eq!(
             canonicalize_topk(actual),
             baseline_topk(&dist_calc, &row_ids, 10)
