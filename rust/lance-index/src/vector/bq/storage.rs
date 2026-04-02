@@ -1043,7 +1043,7 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BinaryHeap, HashMap};
+    use std::collections::HashMap;
 
     use arrow_array::{ArrayRef, Float32Array, UInt64Array};
     use lance_core::ROW_ID;
