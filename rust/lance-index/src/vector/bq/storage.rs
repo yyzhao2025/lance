@@ -333,22 +333,31 @@ impl<'a> RabitDistCalculator<'a> {
             let packed_batch =
                 &self.codes[batch_offset * code_len..(batch_offset + BATCH_SIZE) * code_len];
             let mut quantized_sums = [0u16; BATCH_SIZE];
+            let mut chunk_deltas = [0u16; BATCH_SIZE];
             let mut should_skip_batch = false;
 
-            for byte_idx in 0..code_len {
-                let block_offset = byte_idx * BATCH_SIZE;
-                let packed_block = &packed_batch[block_offset..block_offset + BATCH_SIZE];
-                let dist_table_offset = byte_idx * 2 * SEGMENT_NUM_CODES;
-                let packed_dist_table =
-                    &quantized_dists_table[dist_table_offset..dist_table_offset + BATCH_SIZE];
-                simd::dist_table::accumulate_4bit_packed_block(
-                    packed_block,
-                    packed_dist_table,
-                    &mut quantized_sums,
+            for chunk_start in (0..code_len).step_by(PRUNE_CHUNK_BYTES) {
+                let chunk_end = (chunk_start + PRUNE_CHUNK_BYTES).min(code_len);
+                let chunk_len = chunk_end - chunk_start;
+                let code_offset = chunk_start * BATCH_SIZE;
+                let code_end = chunk_end * BATCH_SIZE;
+                let dist_table_offset = chunk_start * 2 * SEGMENT_NUM_CODES;
+                let dist_table_end = chunk_end * 2 * SEGMENT_NUM_CODES;
+
+                chunk_deltas.fill(0);
+                simd::dist_table::sum_4bit_dist_table(
+                    BATCH_SIZE,
+                    chunk_len,
+                    &packed_batch[code_offset..code_end],
+                    &quantized_dists_table[dist_table_offset..dist_table_end],
+                    &mut chunk_deltas,
                 );
+                for (sum, delta) in quantized_sums.iter_mut().zip(chunk_deltas) {
+                    *sum = sum.saturating_add(delta);
+                }
 
                 if results.len() == k {
-                    let remaining_quantized = suffix_max_quantized[byte_idx + 1];
+                    let remaining_quantized = suffix_max_quantized[chunk_end];
                     let batch_lower_bound = quantized_sums
                         .iter()
                         .enumerate()
@@ -743,6 +752,8 @@ const LOWBIT_IDX: [usize; 16] = {
     }
     array
 };
+
+const PRUNE_CHUNK_BYTES: usize = 16;
 
 fn get_column(
     quantization_code: &[u8],
