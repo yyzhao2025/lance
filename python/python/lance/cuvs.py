@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import tempfile
 from importlib import import_module
@@ -12,6 +14,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from .dependencies import numpy as np
+from .file import LanceFileWriter
 from .log import LOGGER
 from .util import _normalize_metric_type
 
@@ -195,24 +198,108 @@ def _make_shuffle_batch(
     row_ids: np.ndarray,
     partitions: np.ndarray,
     pq_codes: np.ndarray,
+    num_partitions: int,
     num_sub_vectors: int,
-) -> pa.RecordBatch:
-    pq_values = pa.array(pq_codes.reshape(-1))
+) -> tuple[pa.RecordBatch, pa.RecordBatch]:
+    sort_indices = np.argsort(partitions, kind="stable")
+    row_ids = row_ids[sort_indices]
+    partitions = partitions[sort_indices]
+    pq_codes = pq_codes[sort_indices]
+
+    pq_values = pa.array(pq_codes.reshape(-1), type=pa.uint8())
     pq_code_array = pa.FixedSizeListArray.from_arrays(pq_values, num_sub_vectors)
-    return pa.RecordBatch.from_arrays(
+    partition_counts = np.bincount(partitions, minlength=num_partitions).astype(
+        np.uint64, copy=False
+    )
+    offsets = np.cumsum(partition_counts, dtype=np.uint64)
+    data_batch = pa.RecordBatch.from_arrays(
         [
             pa.array(row_ids, type=pa.uint64()),
-            pa.array(partitions, type=pa.uint32()),
             pq_code_array,
         ],
         schema=pa.schema(
             [
-                pa.field("row_id", pa.uint64()),
-                pa.field("__ivf_part_id", pa.uint32()),
+                pa.field("_rowid", pa.uint64()),
                 pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
             ]
         ),
     )
+    offsets_batch = pa.RecordBatch.from_arrays(
+        [pa.array(offsets, type=pa.uint64())],
+        schema=pa.schema([pa.field("offset", pa.uint64())]),
+    )
+    return data_batch, offsets_batch
+
+
+def _shuffle_metadata(
+    num_partitions: int, num_batches: int, partition_counts
+) -> dict[str, str]:
+    return {
+        "lance:shuffle:num_partitions": str(num_partitions),
+        "lance:shuffle:num_batches": str(num_batches),
+        "lance:shuffle:partition_counts": json.dumps(list(partition_counts)),
+        "lance:shuffle:total_loss": "0.0",
+    }
+
+
+def _write_v3_shuffle_files(
+    output_root: str,
+    batches: Iterator[tuple[pa.RecordBatch, pa.RecordBatch]],
+    *,
+    num_partitions: int,
+    num_sub_vectors: int,
+) -> list[str]:
+    os.makedirs(output_root, exist_ok=True)
+    data_path = os.path.join(output_root, "shuffle_data.lance")
+    offsets_path = os.path.join(output_root, "shuffle_offsets.lance")
+
+    data_schema = pa.schema(
+        [
+            pa.field("_rowid", pa.uint64()),
+            pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
+        ]
+    )
+    offsets_schema = pa.schema([pa.field("offset", pa.uint64())])
+
+    data_writer = None
+    offsets_writer = LanceFileWriter(offsets_path, offsets_schema)
+    total_partition_counts = np.zeros(num_partitions, dtype=np.uint64)
+    global_row_count = np.uint64(0)
+    num_batches = 0
+
+    for data_batch, offsets_batch in batches:
+        if data_writer is None:
+            data_writer = LanceFileWriter(data_path, data_batch.schema)
+        data_writer.write_batch(data_batch)
+
+        offsets = offsets_batch.column(0).to_numpy()
+        adjusted_offsets = offsets + global_row_count
+        offsets_writer.write_batch(
+            pa.RecordBatch.from_arrays(
+                [pa.array(adjusted_offsets, type=pa.uint64())],
+                schema=offsets_schema,
+            )
+        )
+        last_offset = np.uint64(0)
+        for idx, offset in enumerate(offsets):
+            total_partition_counts[idx] += np.uint64(offset) - last_offset
+            last_offset = np.uint64(offset)
+        global_row_count += np.uint64(data_batch.num_rows)
+        num_batches += 1
+
+    if data_writer is None:
+        data_writer = LanceFileWriter(data_path, data_schema)
+
+    metadata = _shuffle_metadata(
+        num_partitions, num_batches, total_partition_counts.tolist()
+    )
+    for key, value in metadata.items():
+        data_writer.add_schema_metadata(key, value)
+        offsets_writer.add_schema_metadata(key, value)
+
+    data_writer.close()
+    offsets_writer.close()
+    return ["shuffle_data.lance", "shuffle_offsets.lance"]
 
 
 def _train_ivf_pq_index_on_cuvs(
@@ -283,7 +370,7 @@ def one_pass_assign_ivf_pq_on_cuvs(
     pq_codebook: np.ndarray,
     trained_index=None,
     dst_dataset_uri: str | Path | None = None,
-    batch_size: int = 1024 * 10 * 4,
+    batch_size: int = 1024 * 128,
     *,
     filter_nan: bool = True,
 ):
@@ -308,7 +395,9 @@ def one_pass_assign_ivf_pq_on_cuvs(
     progress = _make_progress(num_rows)
     progress.set_description("Assigning partitions and computing pq codes")
 
-    def _partition_and_pq_codes_assignment() -> Iterator[pa.RecordBatch]:
+    def _partition_and_pq_codes_assignment() -> Iterator[
+        tuple[pa.RecordBatch, pa.RecordBatch]
+    ]:
         for batch in dataset.to_batches(
             columns=[column],
             filter=filt,
@@ -342,41 +431,25 @@ def one_pass_assign_ivf_pq_on_cuvs(
                 row_ids,
                 partitions,
                 pq_codes,
+                ivf_centroids.shape[0],
                 num_sub_vectors,
             )
-            progress.update(partition_batch.num_rows)
+            progress.update(len(row_ids))
             yield partition_batch
 
-    output_schema = pa.schema(
-        [
-            pa.field("row_id", pa.uint64()),
-            pa.field("__ivf_part_id", pa.uint32()),
-            pa.field("__pq_code", pa.list_(pa.uint8(), list_size=num_sub_vectors)),
-        ]
-    )
-    rbr = pa.RecordBatchReader.from_batches(
-        output_schema, _partition_and_pq_codes_assignment()
-    )
     if dst_dataset_uri is None:
         dst_dataset_uri = tempfile.mkdtemp()
         if re.search(r".:\\", dst_dataset_uri) is not None:
             dst_dataset_uri = dst_dataset_uri.replace("\\", "/", 1)
-
-    from . import write_dataset
-
-    ds = write_dataset(
-        rbr,
-        dst_dataset_uri,
-        schema=output_schema,
-        data_storage_version="legacy",
+    shuffle_buffers = _write_v3_shuffle_files(
+        str(dst_dataset_uri),
+        _partition_and_pq_codes_assignment(),
+        num_partitions=ivf_centroids.shape[0],
+        num_sub_vectors=num_sub_vectors,
     )
 
     progress.close()
     LOGGER.info("Saved precomputed pq_codes to %s", dst_dataset_uri)
-
-    shuffle_buffers = [
-        data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()
-    ]
     return str(dst_dataset_uri), shuffle_buffers
 
 

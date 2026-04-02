@@ -2996,7 +2996,7 @@ class LanceDataset(pa.dataset.Dataset):
                     ivf_centroids,
                     pq_codebook,
                     trained_index=trained_index,
-                    batch_size=20480,
+                    batch_size=1024 * 128,
                     filter_nan=filter_nan,
                 )
                 timers["ivf+pq_assign:end"] = time.time()
@@ -3005,9 +3005,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 LOGGER.info("cuVS ivf+pq transform time: %ss", ivfpq_assign_time)
                 kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-                kwargs["precomputed_shuffle_buffers_path"] = os.path.join(
-                    shuffle_output_dir, "data"
-                )
+                kwargs["precomputed_shuffle_buffers_path"] = shuffle_output_dir
             else:
                 from .vector import (
                     one_pass_assign_ivf_pq_on_accelerator,

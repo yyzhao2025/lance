@@ -4,6 +4,7 @@
 //! Shuffler is a component that takes a stream of record batches and shuffles them into
 //! the corresponding IVF partitions.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
@@ -35,6 +36,13 @@ use lance_io::{
 use object_store::path::Path;
 
 use crate::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN};
+
+const SHUFFLE_NUM_PARTITIONS_METADATA_KEY: &str = "lance:shuffle:num_partitions";
+const SHUFFLE_NUM_BATCHES_METADATA_KEY: &str = "lance:shuffle:num_batches";
+const SHUFFLE_PARTITION_COUNTS_METADATA_KEY: &str = "lance:shuffle:partition_counts";
+const SHUFFLE_TOTAL_LOSS_METADATA_KEY: &str = "lance:shuffle:total_loss";
+pub const SHUFFLE_DATA_FILE_NAME: &str = "shuffle_data.lance";
+pub const SHUFFLE_OFFSETS_FILE_NAME: &str = "shuffle_offsets.lance";
 
 #[async_trait::async_trait]
 /// A reader that can read the shuffled partitions.
@@ -435,7 +443,7 @@ impl Shuffler for TwoFileShuffler {
         );
 
         // Create data file writer
-        let data_path = self.output_dir.child("shuffle_data.lance");
+        let data_path = self.output_dir.child(SHUFFLE_DATA_FILE_NAME);
         let spill_path = self.output_dir.child("shuffle_data.spill");
         let writer = self.object_store.create(&data_path).await?;
         let mut file_writer = FileWriter::try_new(
@@ -446,7 +454,7 @@ impl Shuffler for TwoFileShuffler {
         .with_page_metadata_spill(self.object_store.clone(), spill_path);
 
         // Create offsets file writer
-        let offsets_path = self.output_dir.child("shuffle_offsets.lance");
+        let offsets_path = self.output_dir.child(SHUFFLE_OFFSETS_FILE_NAME);
         let spill_path = self.output_dir.child("shuffle_offsets.spill");
         let writer = self.object_store.create(&offsets_path).await?;
         let mut offsets_writer = FileWriter::try_new(
@@ -527,13 +535,37 @@ impl Shuffler for TwoFileShuffler {
                 .await?;
         }
 
+        let partition_counts_json = serde_json::to_string(&partition_counts).map_err(|e| {
+            Error::invalid_input(format!("Failed to serialize shuffle partition counts: {e}"))
+        })?;
+        let num_partitions_str = num_partitions.to_string();
+        let num_batches_str = num_batches
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .to_string();
+        let total_loss_str = total_loss.lock().unwrap().to_string();
+        for writer in [&mut file_writer, &mut offsets_writer] {
+            writer.add_schema_metadata(
+                SHUFFLE_NUM_PARTITIONS_METADATA_KEY,
+                num_partitions_str.clone(),
+            );
+            writer.add_schema_metadata(SHUFFLE_NUM_BATCHES_METADATA_KEY, num_batches_str.clone());
+            writer.add_schema_metadata(
+                SHUFFLE_PARTITION_COUNTS_METADATA_KEY,
+                partition_counts_json.clone(),
+            );
+            writer.add_schema_metadata(SHUFFLE_TOTAL_LOSS_METADATA_KEY, total_loss_str.clone());
+        }
+
         // Finish files
         file_writer.finish().await?;
         offsets_writer.finish().await?;
 
-        let num_batches = num_batches.load(std::sync::atomic::Ordering::Relaxed);
-
-        let total_loss_val = *total_loss.lock().unwrap();
+        let num_batches = num_batches_str
+            .parse::<u64>()
+            .expect("num_batches string was produced from u64");
+        let total_loss_val = total_loss_str
+            .parse::<f64>()
+            .expect("total_loss string was produced from f64");
 
         TwoFileShuffleReader::try_new(
             self.object_store.clone(),
@@ -558,6 +590,46 @@ pub struct TwoFileShuffleReader {
 }
 
 impl TwoFileShuffleReader {
+    pub async fn try_open_existing(
+        object_store: Arc<ObjectStore>,
+        output_dir: Path,
+        data_file: impl AsRef<str>,
+        offsets_file: impl AsRef<str>,
+    ) -> Result<Box<dyn ShuffleReader>> {
+        let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
+        let scheduler = ScanScheduler::new(object_store, scheduler_config);
+
+        let file_reader = FileReader::try_open(
+            scheduler
+                .open_file(
+                    &output_dir.child(data_file.as_ref()),
+                    &CachedFileSize::unknown(),
+                )
+                .await?,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await?;
+
+        let offsets_reader = FileReader::try_open(
+            scheduler
+                .open_file(
+                    &output_dir.child(offsets_file.as_ref()),
+                    &CachedFileSize::unknown(),
+                )
+                .await?,
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &LanceCache::no_cache(),
+            FileReaderOptions::default(),
+        )
+        .await?;
+
+        Self::from_existing_readers(scheduler, file_reader, offsets_reader)
+    }
+
     async fn try_new(
         object_store: Arc<ObjectStore>,
         output_dir: Path,
@@ -573,7 +645,7 @@ impl TwoFileShuffleReader {
         let scheduler_config = SchedulerConfig::max_bandwidth(&object_store);
         let scheduler = ScanScheduler::new(object_store, scheduler_config);
 
-        let data_path = output_dir.child("shuffle_data.lance");
+        let data_path = output_dir.child(SHUFFLE_DATA_FILE_NAME);
         let file_reader = FileReader::try_open(
             scheduler
                 .open_file(&data_path, &CachedFileSize::unknown())
@@ -585,7 +657,7 @@ impl TwoFileShuffleReader {
         )
         .await?;
 
-        let offsets_path = output_dir.child("shuffle_offsets.lance");
+        let offsets_path = output_dir.child(SHUFFLE_OFFSETS_FILE_NAME);
         let offsets_reader = FileReader::try_open(
             scheduler
                 .open_file(&offsets_path, &CachedFileSize::unknown())
@@ -596,6 +668,87 @@ impl TwoFileShuffleReader {
             FileReaderOptions::default(),
         )
         .await?;
+
+        Ok(Box::new(Self {
+            _scheduler: scheduler,
+            file_reader,
+            offsets_reader,
+            num_partitions,
+            num_batches,
+            partition_counts,
+            total_loss,
+        }))
+    }
+
+    fn from_existing_readers(
+        scheduler: Arc<ScanScheduler>,
+        file_reader: FileReader,
+        offsets_reader: FileReader,
+    ) -> Result<Box<dyn ShuffleReader>> {
+        let metadata: &HashMap<String, String> = &offsets_reader.schema().metadata;
+
+        let num_partitions = metadata
+            .get(SHUFFLE_NUM_PARTITIONS_METADATA_KEY)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Missing required metadata key {SHUFFLE_NUM_PARTITIONS_METADATA_KEY} in precomputed V3 shuffle offsets file"
+                ))
+            })?
+            .parse::<usize>()
+            .map_err(|e| {
+                Error::invalid_input(format!(
+                    "Invalid value for {SHUFFLE_NUM_PARTITIONS_METADATA_KEY}: {e}"
+                ))
+            })?;
+        let num_batches = metadata
+            .get(SHUFFLE_NUM_BATCHES_METADATA_KEY)
+            .ok_or_else(|| {
+                Error::invalid_input(format!(
+                    "Missing required metadata key {SHUFFLE_NUM_BATCHES_METADATA_KEY} in precomputed V3 shuffle offsets file"
+                ))
+            })?
+            .parse::<u64>()
+            .map_err(|e| {
+                Error::invalid_input(format!(
+                    "Invalid value for {SHUFFLE_NUM_BATCHES_METADATA_KEY}: {e}"
+                ))
+            })?;
+        let partition_counts = serde_json::from_str::<Vec<u64>>(
+            metadata
+                .get(SHUFFLE_PARTITION_COUNTS_METADATA_KEY)
+                .ok_or_else(|| {
+                    Error::invalid_input(format!(
+                        "Missing required metadata key {SHUFFLE_PARTITION_COUNTS_METADATA_KEY} in precomputed V3 shuffle offsets file"
+                    ))
+                })?,
+        )
+        .map_err(|e| {
+            Error::invalid_input(format!(
+                "Invalid value for {SHUFFLE_PARTITION_COUNTS_METADATA_KEY}: {e}"
+            ))
+        })?;
+        if partition_counts.len() != num_partitions {
+            return Err(Error::invalid_input(format!(
+                "Precomputed V3 shuffle partition count length {} does not match num_partitions {}",
+                partition_counts.len(),
+                num_partitions
+            )));
+        }
+        let total_loss = metadata
+            .get(SHUFFLE_TOTAL_LOSS_METADATA_KEY)
+            .map(|value| {
+                value.parse::<f64>().map_err(|e| {
+                    Error::invalid_input(format!(
+                        "Invalid value for {SHUFFLE_TOTAL_LOSS_METADATA_KEY}: {e}"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(0.0);
+
+        if num_batches == 0 {
+            return Ok(Box::new(EmptyReader));
+        }
 
         Ok(Box::new(Self {
             _scheduler: scheduler,
@@ -842,6 +995,42 @@ mod tests {
 
         let loss = reader.total_loss().unwrap();
         assert!((loss - 4.25).abs() < 1e-10, "expected 4.25, got {}", loss);
+    }
+
+    #[tokio::test]
+    async fn test_two_file_shuffler_reopen_existing_files() {
+        let dir = TempStrDir::default();
+        let output_dir = Path::from(dir.as_ref());
+        let num_partitions = 3;
+
+        let batch1 = make_batch(&[0, 1, 2], &[10, 20, 30], Some(1.5));
+        let batch2 = make_batch(&[2, 0, 1, 0], &[40, 50, 60, 70], Some(2.0));
+
+        let shuffler = TwoFileShuffler::new(output_dir.clone(), num_partitions);
+        let stream = batches_to_stream(vec![batch1, batch2]);
+        let _ = shuffler.shuffle(stream).await.unwrap();
+
+        let reopened = TwoFileShuffleReader::try_open_existing(
+            Arc::new(ObjectStore::local()),
+            output_dir,
+            SHUFFLE_DATA_FILE_NAME,
+            SHUFFLE_OFFSETS_FILE_NAME,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reopened.partition_size(0).unwrap(), 3);
+        assert_eq!(reopened.partition_size(1).unwrap(), 2);
+        assert_eq!(reopened.partition_size(2).unwrap(), 2);
+
+        let p0 = collect_partition(reopened.as_ref(), 0).await.unwrap();
+        let vals: &Int32Array = p0.column_by_name("val").unwrap().as_primitive();
+        let mut v: Vec<i32> = vals.iter().map(|x| x.unwrap()).collect();
+        v.sort();
+        assert_eq!(v, vec![10, 50, 70]);
+
+        let loss = reopened.total_loss().unwrap();
+        assert!((loss - 3.5).abs() < 1e-10, "expected 3.5, got {}", loss);
     }
 
     #[tokio::test]

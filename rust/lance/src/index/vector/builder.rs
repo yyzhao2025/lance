@@ -3,6 +3,7 @@
 
 use std::collections::HashSet;
 use std::future;
+use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
 
@@ -44,7 +45,10 @@ use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
-use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
+use lance_index::vector::v3::shuffler::{
+    EmptyReader, IvfShufflerReader, SHUFFLE_DATA_FILE_NAME, SHUFFLE_OFFSETS_FILE_NAME,
+    TwoFileShuffleReader,
+};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN, VectorIndex};
 use lance_index::vector::{PART_ID_FIELD, ivf::storage::IvfModel};
@@ -141,6 +145,43 @@ type BuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
+    async fn try_open_precomputed_v3_shuffle_reader(
+        &self,
+        root: &Path,
+        files: &[String],
+    ) -> Result<Option<Arc<dyn ShuffleReader>>> {
+        if files.len() != 2 {
+            return Ok(None);
+        }
+
+        let mut data_file = None;
+        let mut offsets_file = None;
+        for file in files {
+            let Some(file_name) = StdPath::new(file).file_name() else {
+                return Ok(None);
+            };
+            match file_name.to_string_lossy().as_ref() {
+                SHUFFLE_DATA_FILE_NAME => data_file = Some(SHUFFLE_DATA_FILE_NAME),
+                SHUFFLE_OFFSETS_FILE_NAME => offsets_file = Some(SHUFFLE_OFFSETS_FILE_NAME),
+                _ => return Ok(None),
+            }
+        }
+        let (Some(data_file), Some(offsets_file)) = (data_file, offsets_file) else {
+            return Ok(None);
+        };
+
+        Ok(Some(
+            TwoFileShuffleReader::try_open_existing(
+                Arc::new(ObjectStore::local()),
+                root.clone(),
+                data_file,
+                offsets_file,
+            )
+            .await?
+            .into(),
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         dataset: Dataset,
@@ -528,13 +569,30 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .as_ref()
             .and_then(|p| p.precomputed_shuffle_buffers.as_ref())
         {
-            Some((uri, _)) => {
+            Some((uri, files)) => {
+                if let Some(reader) = self
+                    .try_open_precomputed_v3_shuffle_reader(uri, files)
+                    .await?
+                {
+                    log::info!("shuffle with precomputed V3 shuffle files from {}", uri);
+                    self.shuffle_reader = Some(reader);
+                    return Ok(());
+                }
+
                 let uri = to_local_path(uri);
-                // the uri points to data directory,
-                // so need to trim the "data" suffix for reading the dataset
-                let uri = uri.trim_end_matches("data");
+                let uri = if StdPath::new(&uri)
+                    .file_name()
+                    .is_some_and(|name| name == "data")
+                {
+                    StdPath::new(&uri)
+                        .parent()
+                        .map(|path| path.to_string_lossy().to_string())
+                        .unwrap_or(uri)
+                } else {
+                    uri
+                };
                 log::info!("shuffle with precomputed shuffle buffers from {}", uri);
-                let ds = Dataset::open(uri).await?;
+                let ds = Dataset::open(&uri).await?;
                 ds.scan().try_into_stream().await?
             }
             _ => {
