@@ -300,6 +300,22 @@ impl<'a> RabitDistCalculator<'a> {
         let range = (qmax - qmin) / 255.0;
         let num_tables = quantized_dists_table.len() / SEGMENT_NUM_CODES;
         let sum_min = num_tables as f32 * qmin;
+        let quantized_dist_multiplier_base = 2.0 * range / self.sqrt_d;
+        let quantized_dist_bias_base = (2.0 * sum_min - self.sum_q) / self.sqrt_d;
+        let quantized_distance_biases = self
+            .scale_factors
+            .iter()
+            .zip(self.add_factors.iter())
+            .map(|(scale, add)| quantized_dist_bias_base * *scale + *add + self.query_factor)
+            .collect::<Vec<_>>();
+        let quantized_distance_inverse_slopes = self
+            .scale_factors
+            .iter()
+            .map(|scale| {
+                let slope = quantized_dist_multiplier_base * *scale;
+                if slope == 0.0 { 0.0 } else { slope.recip() }
+            })
+            .collect::<Vec<_>>();
 
         let mut max_quantized_per_byte = vec![0u32; code_len];
         for (byte_idx, max_value) in max_quantized_per_byte.iter_mut().enumerate() {
@@ -380,12 +396,22 @@ impl<'a> RabitDistCalculator<'a> {
                     let prune_threshold = results.peek().unwrap().dist.0;
                     let mut can_prune_batch = true;
                     for (lane, partial_sum) in quantized_sums.iter().enumerate() {
-                        let saturated_upper_sum = (u32::from(*partial_sum) + remaining_quantized)
+                        let id = batch_offset + lane;
+                        let upper_quantized_sum = (u32::from(*partial_sum) + remaining_quantized)
                             .min(u16::MAX as u32)
                             as f32;
-                        let id = batch_offset + lane;
-                        let dist_upper_bound = saturated_upper_sum * range + sum_min;
-                        if self.finalize_distance(id, dist_upper_bound) <= prune_threshold {
+                        let inverse_slope = quantized_distance_inverse_slopes[id];
+                        if inverse_slope == 0.0 {
+                            if quantized_distance_biases[id] <= prune_threshold {
+                                can_prune_batch = false;
+                                break;
+                            }
+                            continue;
+                        }
+
+                        let required_quantized_sum =
+                            (prune_threshold - quantized_distance_biases[id]) * inverse_slope;
+                        if upper_quantized_sum >= required_quantized_sum.max(0.0) {
                             can_prune_batch = false;
                             break;
                         }
