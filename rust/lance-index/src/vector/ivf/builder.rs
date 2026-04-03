@@ -9,8 +9,6 @@ use std::sync::Arc;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
-use object_store::path::Path;
-
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
 
@@ -48,7 +46,12 @@ pub struct IvfBuildParams {
     /// requires `centroids` to be set
     ///
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
-    pub precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
+    pub precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
+
+    /// Precomputed encoded dataset (_rowid/row_id -> partition_id, pq_code).
+    /// Mutually exclusive with `precomputed_partitions_file` and `precomputed_shuffle_buffers`.
+    /// Requires `centroids` to be set.
+    pub precomputed_encoded_dataset_uri: Option<String>,
 
     pub shuffle_partition_batches: usize,
 
@@ -69,6 +72,7 @@ impl Default for IvfBuildParams {
             sample_rate: 256, // See faiss
             precomputed_partitions_file: None,
             precomputed_shuffle_buffers: None,
+            precomputed_encoded_dataset_uri: None,
             shuffle_partition_batches: 1024 * 10,
             shuffle_partition_concurrency: 2,
             storage_options: None,

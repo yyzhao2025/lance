@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 from importlib import import_module
@@ -17,6 +18,16 @@ from .util import _normalize_metric_type
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+PRECOMPUTED_ENCODED_PARTITION_SIZES_METADATA_KEY = (
+    "lance:index_build:precomputed_encoded_partition_sizes"
+)
+PRECOMPUTED_ENCODED_PARTITION_FRAGMENT_IDS_METADATA_KEY = (
+    "lance:index_build:precomputed_encoded_partition_fragment_ids"
+)
+PRECOMPUTED_ENCODED_TOTAL_LOSS_METADATA_KEY = (
+    "lance:index_build:precomputed_encoded_total_loss"
+)
 
 
 def is_cuvs_accelerator(accelerator: object) -> bool:
@@ -98,6 +109,45 @@ def _column_to_numpy(table: pa.Table | pa.RecordBatch, column: str) -> np.ndarra
 
     values = array.to_pylist()
     return _coerce_float_matrix(np.asarray(values), column=column)
+
+
+def _annotate_precomputed_encoded_dataset(
+    dataset,
+    partition_sizes: list[int],
+    *,
+    total_loss: float | None = None,
+) -> None:
+    partition_fragments = [[] for _ in range(len(partition_sizes))]
+    for fragment in dataset.get_fragments():
+        fragment_partitions = set()
+        scanner = (
+            dataset.scanner(columns=["__ivf_part_id"])
+            .with_fragments([fragment])
+            .to_scanner()
+        )
+        for batch in scanner.to_batches():
+            fragment_partitions.update(
+                int(partition_id)
+                for partition_id in np.unique(
+                    batch.column("__ivf_part_id").to_numpy(zero_copy_only=False)
+                )
+            )
+        for partition_id in fragment_partitions:
+            partition_fragments[partition_id].append(int(fragment.metadata.id))
+
+    metadata = {
+        PRECOMPUTED_ENCODED_PARTITION_SIZES_METADATA_KEY: json.dumps(
+            [int(size) for size in partition_sizes]
+        ),
+        PRECOMPUTED_ENCODED_PARTITION_FRAGMENT_IDS_METADATA_KEY: json.dumps(
+            partition_fragments
+        ),
+    }
+    if total_loss is not None:
+        metadata[PRECOMPUTED_ENCODED_TOTAL_LOSS_METADATA_KEY] = json.dumps(
+            float(total_loss)
+        )
+    dataset.update_metadata(metadata)
 
 
 def _as_numpy(array_like) -> np.ndarray:
@@ -295,6 +345,8 @@ def one_pass_assign_ivf_pq_on_cuvs(
 
     progress = _make_progress(num_rows)
     progress.set_description("Assigning partitions and computing pq codes")
+    num_partitions = ivf_centroids.shape[0]
+    partition_sizes = np.zeros(num_partitions, dtype=np.int64)
 
     output_schema = pa.schema(
         [
@@ -327,6 +379,7 @@ def one_pass_assign_ivf_pq_on_cuvs(
                 trained_index, _to_cuvs_transform_input(vectors)
             )
             partitions = _as_numpy(partitions).astype(np.uint32, copy=False)
+            partition_sizes[:] += np.bincount(partitions, minlength=num_partitions)
             pq_codes = _as_numpy(pq_codes).astype(np.uint8, copy=False)
             if pq_codes.shape != (len(row_ids), num_sub_vectors):
                 raise ValueError(
@@ -361,6 +414,9 @@ def one_pass_assign_ivf_pq_on_cuvs(
         dst_dataset_uri,
         schema=output_schema,
         data_storage_version="2.2",
+    )
+    _annotate_precomputed_encoded_dataset(
+        ds, partition_sizes.astype(int).tolist()
     )
     shuffle_buffers = [
         data_file.path for frag in ds.get_fragments() for data_file in frag.data_files()

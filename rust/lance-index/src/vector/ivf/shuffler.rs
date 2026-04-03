@@ -246,12 +246,18 @@ pub async fn shuffle_dataset(
     num_partitions: u32,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
-    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
+    precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
 ) -> Result<Vec<impl Stream<Item = Result<RecordBatch>>>> {
     // step 1: either use precomputed shuffle files or write shuffle data to a file
     let shuffler = if let Some((path, buffers)) = precomputed_shuffle_buffers {
         info!("Precomputed shuffle files provided, skip calculation of IVF partition.");
-        let mut shuffler = IvfShuffler::try_new(num_partitions, Some(path), true, None)?;
+        if path.contains("://") {
+            return Err(Error::not_supported(
+                "legacy IVF shuffler does not support remote precomputed_shuffle_buffers; use the V3 vector index builder path instead".to_string(),
+            ));
+        }
+        let mut shuffler =
+            IvfShuffler::try_new(num_partitions, Some(Path::parse(&path)?), true, None)?;
         unsafe {
             shuffler.set_unsorted_buffers(&buffers);
         }

@@ -22,7 +22,6 @@ use lance_index::vector::{ivf::storage::IvfModel, transform::Transformer};
 use lance_io::stream::RecordBatchStreamAdapter;
 use lance_table::io::manifest::ManifestDescribing;
 use log::info;
-use object_store::path::Path;
 use tracing::instrument;
 
 use lance_core::{Error, ROW_ID, Result, traits::DatasetTakeRows};
@@ -55,7 +54,7 @@ pub(super) async fn build_partitions(
     precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
-    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
+    precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
 ) -> Result<()> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {
@@ -254,7 +253,7 @@ pub(super) async fn build_hnsw_partitions(
     precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
-    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
+    precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
 ) -> Result<(Vec<HnswMetadata>, IvfModel)> {
     let schema = data.schema();
     if schema.column_with_name(column).is_none() {

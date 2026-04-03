@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::{any::Any, collections::HashMap};
 
 pub mod builder;
+mod encoded_dataset;
 pub mod ivf;
 pub mod pq;
 pub mod utils;
@@ -1655,6 +1656,7 @@ fn derive_ivf_params(ivf_model: &IvfModel) -> IvfBuildParams {
         sample_rate: 256, // Default
         precomputed_partitions_file: None,
         precomputed_shuffle_buffers: None,
+        precomputed_encoded_dataset_uri: None,
         shuffle_partition_batches: 1024 * 10, // Default
         shuffle_partition_concurrency: 2,     // Default
         storage_options: None,

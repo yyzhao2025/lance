@@ -2985,10 +2985,7 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 LOGGER.info("cuVS ivf+pq training time: %ss", ivfpq_train_time)
                 timers["ivf+pq_assign:start"] = time.time()
-                (
-                    shuffle_output_dir,
-                    shuffle_buffers,
-                ) = one_pass_assign_ivf_pq_on_cuvs(
+                shuffle_output_dir, _ = one_pass_assign_ivf_pq_on_cuvs(
                     self,
                     column[0],
                     metric,
@@ -3004,8 +3001,7 @@ class LanceDataset(pa.dataset.Dataset):
                     timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
                 )
                 LOGGER.info("cuVS ivf+pq transform time: %ss", ivfpq_assign_time)
-                kwargs["precomputed_shuffle_buffers"] = shuffle_buffers
-                kwargs["precomputed_shuffle_buffers_path"] = shuffle_output_dir
+                kwargs["precomputed_encoded_dataset_uri"] = shuffle_output_dir
             else:
                 from .vector import (
                     one_pass_assign_ivf_pq_on_accelerator,
@@ -3212,6 +3208,13 @@ class LanceDataset(pa.dataset.Dataset):
             LOGGER.info(
                 "Temporary shuffle buffers stored at %s, you may want to delete it.",
                 kwargs["precomputed_shuffle_buffers_path"],
+            )
+        if "precomputed_encoded_dataset_uri" in kwargs.keys() and os.path.exists(
+            kwargs["precomputed_encoded_dataset_uri"]
+        ):
+            LOGGER.info(
+                "Temporary precomputed encoded dataset stored at %s, you may want to delete it.",
+                kwargs["precomputed_encoded_dataset_uri"],
             )
         return index
 

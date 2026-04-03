@@ -71,8 +71,11 @@ use lance_index::{
     MIN_PARTITION_SIZE_PERCENT,
 };
 use lance_io::local::to_local_path;
+use lance_io::object_store::{
+    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
+};
 use lance_io::stream::RecordBatchStream;
-use lance_io::{object_store::ObjectStore, stream::RecordBatchStreamAdapter};
+use lance_io::stream::RecordBatchStreamAdapter;
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
 use lance_linalg::kernels::normalize_fsl;
 use log::info;
@@ -82,12 +85,14 @@ use tracing::{Level, instrument, span};
 
 use crate::Dataset;
 use crate::dataset::ProjectionRequest;
+use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::index::dataset_format_version;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::{infer_vector_dim, infer_vector_element_type};
 
 use super::v2::IVFIndex;
 use super::{
+    encoded_dataset::EncodedDatasetShuffleReader,
     ivf::load_precomputed_partitions_if_available,
     utils::{self, get_vector_type},
 };
@@ -145,9 +150,41 @@ type BuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
+    fn precomputed_shuffle_buffers_uri(root: &str) -> String {
+        let uri = root.to_string();
+        if uri.contains("://") {
+            uri
+        } else {
+            to_local_path(&Path::from(root))
+        }
+    }
+
+    fn precomputed_shuffle_buffers_root_uri(root: &str) -> String {
+        let uri = Self::precomputed_shuffle_buffers_uri(root);
+        if uri.ends_with("/data") {
+            uri.trim_end_matches("/data").to_string()
+        } else {
+            uri
+        }
+    }
+
+    fn object_store_params(&self) -> ObjectStoreParams {
+        let mut params = ObjectStoreParams::default();
+        if let Some(storage_options) = self
+            .ivf_params
+            .as_ref()
+            .and_then(|params| params.storage_options.clone())
+        {
+            params.storage_options_accessor = Some(Arc::new(
+                StorageOptionsAccessor::with_static_options(storage_options),
+            ));
+        }
+        params
+    }
+
     async fn try_open_precomputed_v3_shuffle_reader(
         &self,
-        root: &Path,
+        root: &str,
         files: &[String],
     ) -> Result<Option<Arc<dyn ShuffleReader>>> {
         if files.len() != 2 {
@@ -169,16 +206,37 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let (Some(data_file), Some(offsets_file)) = (data_file, offsets_file) else {
             return Ok(None);
         };
+        let registry = Arc::new(ObjectStoreRegistry::default());
+        let params = self.object_store_params();
+        let (object_store, output_dir) = ObjectStore::from_uri_and_params(
+            registry,
+            &Self::precomputed_shuffle_buffers_root_uri(root),
+            &params,
+        )
+        .await?;
 
         Ok(Some(
             TwoFileShuffleReader::try_open_existing(
-                Arc::new(ObjectStore::local()),
-                root.clone(),
+                object_store,
+                output_dir,
                 data_file,
                 offsets_file,
             )
             .await?
             .into(),
+        ))
+    }
+
+    async fn try_open_precomputed_encoded_dataset_reader(
+        &self,
+        uri: &str,
+    ) -> Result<Arc<dyn ShuffleReader>> {
+        let storage_options = self
+            .ivf_params
+            .as_ref()
+            .and_then(|params| params.storage_options.as_ref());
+        Ok(Arc::new(
+            EncodedDatasetShuffleReader::try_open(uri, storage_options).await?,
         ))
     }
 
@@ -564,6 +622,19 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             return Err(Error::invalid_input("dataset not set before shuffling"));
         };
 
+        if let Some(uri) = self
+            .ivf_params
+            .as_ref()
+            .and_then(|params| params.precomputed_encoded_dataset_uri.as_deref())
+        {
+            log::info!("shuffle with precomputed encoded dataset from {}", uri);
+            self.shuffle_reader = Some(
+                self.try_open_precomputed_encoded_dataset_reader(uri)
+                    .await?,
+            );
+            return Ok(());
+        }
+
         let stream = match self
             .ivf_params
             .as_ref()
@@ -579,7 +650,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     return Ok(());
                 }
 
-                let uri = to_local_path(uri);
+                let uri = Self::precomputed_shuffle_buffers_root_uri(uri);
                 let uri = if StdPath::new(&uri)
                     .file_name()
                     .is_some_and(|name| name == "data")
@@ -592,7 +663,15 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     uri
                 };
                 log::info!("shuffle with precomputed shuffle buffers from {}", uri);
-                let ds = Dataset::open(&uri).await?;
+                let mut builder = DatasetBuilder::from_uri(&uri);
+                if let Some(storage_options) = self
+                    .ivf_params
+                    .as_ref()
+                    .and_then(|params| params.storage_options.clone())
+                {
+                    builder = builder.with_storage_options(storage_options);
+                }
+                let ds = builder.load().await?;
                 ds.scan().try_into_stream().await?
             }
             _ => {
@@ -2295,5 +2374,15 @@ mod tests {
         assert!(batches[0].column_by_name(PART_ID_COLUMN).is_none());
         let row_ids = batches[0][ROW_ID].as_primitive::<UInt64Type>();
         assert_eq!(row_ids.values(), &[4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn precomputed_shuffle_buffer_uri_preserves_remote_uri() {
+        assert_eq!(
+            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::precomputed_shuffle_buffers_root_uri(
+                "s3://bucket/shuffle"
+            ),
+            "s3://bucket/shuffle"
+        );
     }
 }

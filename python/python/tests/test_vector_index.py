@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
 import logging
+import json
 import os
 import platform
 import random
@@ -612,6 +613,9 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
             ),
             shuffle_ds_uri,
         )
+        lance_cuvs._annotate_precomputed_encoded_dataset(
+            shuffle_ds, [len(row_ids), 0, 0, 0]
+        )
         shuffle_buffers = [
             data_file.path
             for frag in shuffle_ds.get_fragments()
@@ -803,7 +807,7 @@ def test_cuvs_as_numpy_prefers_copy_to_host():
     assert array.dtype == np.float32
 
 
-def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path, monkeypatch):
+def test_one_pass_assign_ivf_pq_on_cuvs_writes_encoded_dataset(tmp_path, monkeypatch):
     tbl = create_table(nvec=32, ndim=16)
     dataset = lance.write_dataset(tbl, tmp_path / "cuvs_assign_src")
 
@@ -861,6 +865,19 @@ def test_one_pass_assign_ivf_pq_on_cuvs_writes_shuffle_buffers(tmp_path, monkeyp
     assert data_batch.column("row_id").type == pa.uint64()
     assert data_batch.column("__ivf_part_id").type == pa.uint32()
     assert data_batch.column("__pq_code").type == pa.list_(pa.uint8(), 4)
+    metadata = shuffle_ds.metadata()
+    assert json.loads(
+        metadata[
+            lance_cuvs.PRECOMPUTED_ENCODED_PARTITION_SIZES_METADATA_KEY
+        ]
+    ) == [8, 8, 8, 8]
+    partition_fragments = json.loads(
+        metadata[
+            lance_cuvs.PRECOMPUTED_ENCODED_PARTITION_FRAGMENT_IDS_METADATA_KEY
+        ]
+    )
+    assert len(partition_fragments) == 4
+    assert all(partition_fragments)
 
 
 def test_one_pass_assign_ivf_pq_on_cuvs_rejects_incompatible_transform_width(
