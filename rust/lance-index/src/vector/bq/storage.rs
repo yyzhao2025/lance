@@ -333,30 +333,38 @@ impl<'a> RabitDistCalculator<'a> {
             let packed_batch =
                 &self.codes[batch_offset * code_len..(batch_offset + BATCH_SIZE) * code_len];
             let mut quantized_sums = [0u16; BATCH_SIZE];
-            let mut chunk_deltas = [0u16; BATCH_SIZE];
-            let mut should_skip_batch = false;
-
-            for chunk_start in (0..code_len).step_by(PRUNE_CHUNK_BYTES) {
-                let chunk_end = (chunk_start + PRUNE_CHUNK_BYTES).min(code_len);
-                let chunk_len = chunk_end - chunk_start;
-                let code_offset = chunk_start * BATCH_SIZE;
-                let code_end = chunk_end * BATCH_SIZE;
-                let dist_table_offset = chunk_start * 2 * SEGMENT_NUM_CODES;
-                let dist_table_end = chunk_end * 2 * SEGMENT_NUM_CODES;
-
-                chunk_deltas.fill(0);
+            if results.len() < k {
                 simd::dist_table::sum_4bit_dist_table(
                     BATCH_SIZE,
-                    chunk_len,
-                    &packed_batch[code_offset..code_end],
-                    &quantized_dists_table[dist_table_offset..dist_table_end],
-                    &mut chunk_deltas,
+                    code_len,
+                    packed_batch,
+                    &quantized_dists_table,
+                    &mut quantized_sums,
                 );
-                for (sum, delta) in quantized_sums.iter_mut().zip(chunk_deltas) {
-                    *sum = sum.saturating_add(delta);
-                }
+            } else {
+                let mut chunk_deltas = [0u16; BATCH_SIZE];
+                let mut should_skip_batch = false;
 
-                if results.len() == k {
+                for chunk_start in (0..code_len).step_by(PRUNE_CHUNK_BYTES) {
+                    let chunk_end = (chunk_start + PRUNE_CHUNK_BYTES).min(code_len);
+                    let chunk_len = chunk_end - chunk_start;
+                    let code_offset = chunk_start * BATCH_SIZE;
+                    let code_end = chunk_end * BATCH_SIZE;
+                    let dist_table_offset = chunk_start * 2 * SEGMENT_NUM_CODES;
+                    let dist_table_end = chunk_end * 2 * SEGMENT_NUM_CODES;
+
+                    chunk_deltas.fill(0);
+                    simd::dist_table::sum_4bit_dist_table(
+                        BATCH_SIZE,
+                        chunk_len,
+                        &packed_batch[code_offset..code_end],
+                        &quantized_dists_table[dist_table_offset..dist_table_end],
+                        &mut chunk_deltas,
+                    );
+                    for (sum, delta) in quantized_sums.iter_mut().zip(chunk_deltas) {
+                        *sum = sum.saturating_add(delta);
+                    }
+
                     let remaining_quantized = suffix_max_quantized[chunk_end];
                     let batch_lower_bound = quantized_sums
                         .iter()
@@ -379,10 +387,10 @@ impl<'a> RabitDistCalculator<'a> {
                         break;
                     }
                 }
-            }
 
-            if should_skip_batch {
-                continue;
+                if should_skip_batch {
+                    continue;
+                }
             }
 
             stats.searched_rows += BATCH_SIZE;
@@ -753,7 +761,7 @@ const LOWBIT_IDX: [usize; 16] = {
     array
 };
 
-const PRUNE_CHUNK_BYTES: usize = 16;
+const PRUNE_CHUNK_BYTES: usize = 64;
 
 fn get_column(
     quantization_code: &[u8],
