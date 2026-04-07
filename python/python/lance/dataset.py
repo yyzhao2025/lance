@@ -2960,48 +2960,29 @@ class LanceDataset(pa.dataset.Dataset):
                 )
 
             if use_cuvs:
-                from .cuvs import (
-                    _train_ivf_pq_index_on_cuvs,
-                    one_pass_assign_ivf_pq_on_cuvs,
-                )
+                from .cuvs import build_vector_index_on_cuvs
 
-                LOGGER.info("Doing one-pass ivfpq cuVS training")
-                timers["ivf+pq_train:start"] = time.time()
-                trained_index, ivf_centroids, pq_codebook = _train_ivf_pq_index_on_cuvs(
+                LOGGER.info("Doing cuVS vector backend build")
+                timers["ivf+pq_build:start"] = time.time()
+                artifact_root, _, ivf_centroids, pq_codebook = build_vector_index_on_cuvs(
                     self,
                     column[0],
-                    num_partitions,
                     metric,
                     accelerator,
-                    num_sub_vectors=num_sub_vectors,
+                    num_partitions,
+                    num_sub_vectors,
                     sample_rate=kwargs.get("sample_rate", 256),
                     max_iters=kwargs.get("max_iters", 50),
                     num_bits=kwargs.get("num_bits", 8),
-                    filter_nan=filter_nan,
-                )
-                timers["ivf+pq_train:end"] = time.time()
-                ivfpq_train_time = (
-                    timers["ivf+pq_train:end"] - timers["ivf+pq_train:start"]
-                )
-                LOGGER.info("cuVS ivf+pq training time: %ss", ivfpq_train_time)
-                timers["ivf+pq_assign:start"] = time.time()
-                artifact_root, _ = one_pass_assign_ivf_pq_on_cuvs(
-                    self,
-                    column[0],
-                    metric,
-                    accelerator,
-                    ivf_centroids,
-                    pq_codebook,
-                    trained_index=trained_index,
                     batch_size=1024 * 128,
                     filter_nan=filter_nan,
                 )
                 kwargs["precomputed_partition_artifact_uri"] = artifact_root
-                timers["ivf+pq_assign:end"] = time.time()
-                ivfpq_assign_time = (
-                    timers["ivf+pq_assign:end"] - timers["ivf+pq_assign:start"]
+                timers["ivf+pq_build:end"] = time.time()
+                ivfpq_build_time = (
+                    timers["ivf+pq_build:end"] - timers["ivf+pq_build:start"]
                 )
-                LOGGER.info("cuVS ivf+pq transform time: %ss", ivfpq_assign_time)
+                LOGGER.info("cuVS ivf+pq build time: %ss", ivfpq_build_time)
             else:
                 from .vector import (
                     one_pass_assign_ivf_pq_on_accelerator,

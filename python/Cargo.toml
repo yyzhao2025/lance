@@ -35,7 +35,6 @@ lance = { path = "../rust/lance", features = [
 ] }
 lance-arrow = { path = "../rust/lance-arrow" }
 lance-core = { path = "../rust/lance-core" }
-lance-cuvs = { path = "../rust/lance-cuvs", optional = true }
 lance-datagen = { path = "../rust/lance-datagen", optional = true }
 lance-encoding = { path = "../rust/lance-encoding" }
 lance-file = { path = "../rust/lance-file" }
@@ -76,7 +75,6 @@ bytes = "1.4"
 
 [features]
 default = []
-cuvs = ["dep:lance-cuvs"]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
 

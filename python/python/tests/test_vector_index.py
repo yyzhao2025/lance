@@ -30,8 +30,7 @@ from lance.vector import vec_to_table  # noqa: E402
 
 
 def _disable_rust_cuvs_backend(monkeypatch):
-    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_on_cuvs_rust_impl", None)
-    monkeypatch.setattr(lance_cuvs, "_assign_ivf_pq_on_cuvs_rust_impl", None)
+    del monkeypatch
 
 
 def create_table(nvec=1000, ndim=128, nans=0, nullify=False, dtype=np.float32):
@@ -549,22 +548,14 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
     dataset = lance.write_dataset(tbl, tmp_path)
     calls = {}
 
-    class FakeIndex:
-        pq_dim = 16
-        pq_bits = 8
-
-    def fake_train(
+    def fake_build(
         dataset_arg,
         column,
-        num_partitions,
         metric_type,
         accelerator,
+        num_partitions,
         num_sub_vectors,
-        *,
-        sample_rate,
-        max_iters,
-        num_bits,
-        filter_nan,
+        **kwargs,
     ):
         calls["dataset"] = dataset_arg
         calls["column"] = column
@@ -572,52 +563,16 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
         calls["metric_type"] = metric_type
         calls["accelerator"] = accelerator
         calls["num_sub_vectors"] = num_sub_vectors
-        calls["sample_rate"] = sample_rate
-        calls["max_iters"] = max_iters
-        calls["num_bits"] = num_bits
-        calls["filter_nan"] = filter_nan
-        return (
-            FakeIndex(),
-            np.random.randn(num_partitions, 128).astype(np.float32),
-            np.random.randn(num_sub_vectors, 256, 128 // num_sub_vectors).astype(
-                np.float32
-            ),
-        )
-
-    def fake_assign(
-        dataset_arg,
-        column,
-        metric_type,
-        accelerator,
-        ivf_centroids,
-        pq_codebook,
-        trained_index,
-        dst_path=None,
-        batch_size=20480,
-        *,
-        filter_nan,
-    ):
-        calls["assign_dataset"] = dataset_arg
-        calls["assign_column"] = column
-        calls["assign_metric_type"] = metric_type
-        calls["assign_accelerator"] = accelerator
-        calls["assign_ivf_centroids"] = ivf_centroids
-        calls["assign_pq_codebook"] = pq_codebook
-        calls["assign_trained_index"] = trained_index
-        calls["assign_batch_size"] = batch_size
-        calls["assign_filter_nan"] = filter_nan
+        calls["kwargs"] = kwargs
         return str(tmp_path / "cuvs_artifact"), [
             "manifest.json",
             "metadata.lance",
             "partitions/bucket-00000.lance",
-        ]
+        ], np.random.randn(num_partitions, 128).astype(np.float32), np.random.randn(
+            num_sub_vectors, 256, 128 // num_sub_vectors
+        ).astype(np.float32)
 
-    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_index_on_cuvs", fake_train)
-    monkeypatch.setattr(
-        lance_cuvs,
-        "one_pass_assign_ivf_pq_on_cuvs",
-        fake_assign,
-    )
+    monkeypatch.setattr(lance_cuvs, "build_vector_index_on_cuvs", fake_build)
 
     dataset = dataset.create_index(
         "vector",
@@ -632,10 +587,11 @@ def test_create_index_cuvs_dispatch(tmp_path, monkeypatch):
     assert calls["metric_type"] == "L2"
     assert calls["accelerator"] == "cuvs"
     assert calls["num_sub_vectors"] == 16
-    assert calls["assign_column"] == "vector"
-    assert calls["assign_metric_type"] == "L2"
-    assert calls["assign_accelerator"] == "cuvs"
-    assert isinstance(calls["assign_trained_index"], FakeIndex)
+    assert calls["kwargs"]["sample_rate"] == 256
+    assert calls["kwargs"]["max_iters"] == 50
+    assert calls["kwargs"]["num_bits"] == 8
+    assert calls["kwargs"]["batch_size"] == 1024 * 128
+    assert calls["kwargs"]["filter_nan"] is True
     assert dataset.stats.index_stats("vector_idx")["index_type"] == "IVF_PQ"
 
 
@@ -739,55 +695,6 @@ def test_train_ivf_pq_on_cuvs_nullable_vectors(tmp_path, monkeypatch):
 
     assert centroids.shape == (4, 16)
     assert pq_codebook.shape == (4, 256, 4)
-
-
-def test_train_ivf_pq_on_cuvs_prefers_rust_backend(tmp_path, monkeypatch):
-    dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path)
-    calls = {}
-
-    class FakeRustIndex:
-        pass
-
-    def fake_train(*args, **kwargs):
-        calls["args"] = args
-        calls["kwargs"] = kwargs
-        return (
-            FakeRustIndex(),
-            pa.FixedSizeListArray.from_arrays(
-                pa.array(np.arange(64, dtype=np.float32)), 16
-            ),
-            pa.FixedSizeListArray.from_arrays(
-                pa.array(np.arange(4 * 256 * 4, dtype=np.float32)), 4
-            ),
-        )
-
-    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_on_cuvs_rust_impl", fake_train)
-    monkeypatch.setattr(lance_cuvs, "_assign_ivf_pq_on_cuvs_rust_impl", object())
-    monkeypatch.setattr(
-        lance_cuvs,
-        "_require_cuvs",
-        lambda: (_ for _ in ()).throw(AssertionError("python cuVS backend should not run")),
-    )
-
-    trained_index, centroids, pq_codebook = lance_cuvs._train_ivf_pq_index_on_cuvs(
-        dataset,
-        "vector",
-        4,
-        "l2",
-        "cuvs",
-        4,
-        sample_rate=8,
-        max_iters=30,
-        num_bits=8,
-        filter_nan=True,
-    )
-
-    assert isinstance(trained_index, FakeRustIndex)
-    assert calls["args"][:5] == (dataset, "vector", 4, "l2", 4)
-    assert calls["kwargs"]["sample_rate"] == 8
-    assert calls["kwargs"]["max_iters"] == 30
-    assert isinstance(centroids, pa.FixedSizeListArray)
-    assert isinstance(pq_codebook, pa.FixedSizeListArray)
 
 
 def test_train_ivf_pq_on_cuvs_uses_num_sub_vectors_for_pq_dim(
@@ -956,50 +863,6 @@ def test_one_pass_assign_ivf_pq_on_cuvs_writes_partition_artifact(tmp_path, monk
     bucket_table = bucket_reader.read_all().to_table()
     assert bucket_table.column("_rowid").type == pa.uint64()
     assert bucket_table.column("__pq_code").type == pa.list_(pa.uint8(), 4)
-
-
-def test_one_pass_assign_ivf_pq_on_cuvs_prefers_rust_backend(tmp_path, monkeypatch):
-    dataset = lance.write_dataset(create_table(nvec=32, ndim=16), tmp_path / "cuvs_assign_rust")
-    calls = {}
-
-    class FakeRustIndex:
-        pass
-
-    def fake_assign(*args, **kwargs):
-        calls["args"] = args
-        calls["kwargs"] = kwargs
-        return ["manifest.json", "metadata.lance", "partitions/bucket-00000.lance"]
-
-    monkeypatch.setattr(lance_cuvs, "_train_ivf_pq_on_cuvs_rust_impl", object())
-    monkeypatch.setattr(lance_cuvs, "_assign_ivf_pq_on_cuvs_rust_impl", fake_assign)
-    monkeypatch.setattr(
-        lance_cuvs,
-        "_require_cuvs",
-        lambda: (_ for _ in ()).throw(AssertionError("python cuVS backend should not run")),
-    )
-
-    artifact_root, artifact_files = lance_cuvs.one_pass_assign_ivf_pq_on_cuvs(
-        dataset,
-        "vector",
-        "l2",
-        "cuvs",
-        np.random.randn(4, 16).astype(np.float32),
-        np.random.randn(4, 256, 4).astype(np.float32),
-        trained_index=FakeRustIndex(),
-        dst_dataset_uri=tmp_path / "artifact",
-        batch_size=4096,
-    )
-
-    assert artifact_root == str(tmp_path / "artifact")
-    assert artifact_files[0] == "manifest.json"
-    assert calls["args"][:4] == (
-        dataset,
-        "vector",
-        calls["args"][2],
-        str(tmp_path / "artifact"),
-    )
-    assert isinstance(calls["args"][2], FakeRustIndex)
-    assert calls["kwargs"]["batch_size"] == 4096
 
 
 def test_one_pass_assign_ivf_pq_on_cuvs_rejects_incompatible_transform_width(

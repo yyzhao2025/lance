@@ -38,28 +38,49 @@ PARTITION_ARTIFACT_PARTITIONS_DIR = "partitions"
 DEFAULT_PARTITION_ARTIFACT_BUCKETS = 256
 PARTITION_ARTIFACT_ROW_ID_COLUMN = "_rowid"
 
-try:
-    from . import lance as _lance_ext
+def build_vector_index_on_cuvs(
+    dataset,
+    column: str,
+    metric_type: str,
+    accelerator: str,
+    num_partitions: int,
+    num_sub_vectors: int,
+    dst_dataset_uri: str | Path | None = None,
+    *,
+    sample_rate: int = 256,
+    max_iters: int = 50,
+    num_bits: int = 8,
+    batch_size: int = 1024 * 128,
+    filter_nan: bool = True,
+):
+    if dst_dataset_uri is None:
+        dst_dataset_uri = tempfile.mkdtemp()
 
-    _assign_ivf_pq_on_cuvs_rust_impl = getattr(
-        _lance_ext.indices, "_assign_ivf_pq_on_cuvs_rust"
+    trained_index, ivf_centroids, pq_codebook = _train_ivf_pq_index_on_cuvs(
+        dataset,
+        column,
+        num_partitions,
+        metric_type,
+        accelerator,
+        num_sub_vectors=num_sub_vectors,
+        sample_rate=sample_rate,
+        max_iters=max_iters,
+        num_bits=num_bits,
+        filter_nan=filter_nan,
     )
-    _train_ivf_pq_on_cuvs_rust_impl = getattr(
-        _lance_ext.indices, "_train_ivf_pq_on_cuvs_rust"
+    artifact_root, artifact_files = one_pass_assign_ivf_pq_on_cuvs(
+        dataset,
+        column,
+        metric_type,
+        accelerator,
+        ivf_centroids,
+        pq_codebook,
+        trained_index=trained_index,
+        dst_dataset_uri=dst_dataset_uri,
+        batch_size=batch_size,
+        filter_nan=filter_nan,
     )
-except (ImportError, AttributeError):
-    _assign_ivf_pq_on_cuvs_rust_impl = None
-    _train_ivf_pq_on_cuvs_rust_impl = None
-
-
-def _has_rust_cuvs_backend() -> bool:
-    return (
-        _train_ivf_pq_on_cuvs_rust_impl is not None
-        and _assign_ivf_pq_on_cuvs_rust_impl is not None
-    )
-
-def _unwrap_dataset(dataset):
-    return getattr(dataset, "_ds", dataset)
+    return artifact_root, artifact_files, ivf_centroids, pq_codebook
 
 
 def is_cuvs_accelerator(accelerator: object) -> bool:
@@ -374,19 +395,6 @@ def _train_ivf_pq_index_on_cuvs(
     num_bits: int = 8,
     filter_nan: bool = True,
 ):
-    if _has_rust_cuvs_backend():
-        return _train_ivf_pq_on_cuvs_rust_impl(
-            _unwrap_dataset(dataset),
-            column,
-            num_partitions,
-            metric_type,
-            num_sub_vectors,
-            sample_rate=sample_rate,
-            max_iters=max_iters,
-            num_bits=num_bits,
-            filter_nan=filter_nan,
-        )
-
     if accelerator != "cuvs":
         raise ValueError("cuVS acceleration only supports accelerator='cuvs'")
     if num_bits != 8:
@@ -446,27 +454,6 @@ def one_pass_assign_ivf_pq_on_cuvs(
     *,
     filter_nan: bool = True,
 ):
-    if _has_rust_cuvs_backend():
-        if accelerator != "cuvs":
-            raise ValueError("cuVS acceleration only supports accelerator='cuvs'")
-        if trained_index is None:
-            raise ValueError(
-                "one_pass_assign_ivf_pq_on_cuvs requires a trained cuVS index for "
-                "single-node transform"
-            )
-        if dst_dataset_uri is None:
-            dst_dataset_uri = tempfile.mkdtemp()
-        artifact_files = _assign_ivf_pq_on_cuvs_rust_impl(
-            _unwrap_dataset(dataset),
-            column,
-            trained_index,
-            str(dst_dataset_uri),
-            batch_size=batch_size,
-            filter_nan=filter_nan,
-        )
-        LOGGER.info("Saved precomputed partition artifact to %s", dst_dataset_uri)
-        return str(dst_dataset_uri), artifact_files
-
     if accelerator != "cuvs":
         raise ValueError("cuVS acceleration only supports accelerator='cuvs'")
 

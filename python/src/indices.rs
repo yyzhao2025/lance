@@ -32,8 +32,6 @@ use pyo3::{
 };
 
 use lance::index::DatasetIndexInternalExt;
-#[cfg(feature = "cuvs")]
-use lance_cuvs::TrainedIvfPqIndex;
 
 use crate::fragment::FileFragment;
 use crate::utils::{PyJson, PyLance};
@@ -155,89 +153,6 @@ impl PyIvfModel {
             Ok(None)
         }
     }
-}
-
-#[cfg(feature = "cuvs")]
-#[pyclass(name = "_CuvsIvfPqIndex", module = "lance.indices", unsendable)]
-pub struct PyCuvsIvfPqIndex {
-    inner: TrainedIvfPqIndex,
-}
-
-#[cfg(feature = "cuvs")]
-#[pyfunction]
-#[allow(clippy::too_many_arguments)]
-#[pyo3(
-    signature=(
-        dataset,
-        column,
-        num_partitions,
-        distance_type,
-        num_sub_vectors,
-        sample_rate=256,
-        max_iters=50,
-        num_bits=8,
-        filter_nan=true
-    )
-)]
-fn _train_ivf_pq_on_cuvs_rust<'py>(
-    py: Python<'py>,
-    dataset: &Dataset,
-    column: &str,
-    num_partitions: u32,
-    distance_type: &str,
-    num_sub_vectors: u32,
-    sample_rate: u32,
-    max_iters: u32,
-    num_bits: u8,
-    filter_nan: bool,
-) -> PyResult<(Py<PyCuvsIvfPqIndex>, Bound<'py, PyAny>, Bound<'py, PyAny>)> {
-    let distance_type = DistanceType::try_from(distance_type).unwrap();
-    let trained = rt()
-        .runtime
-        .block_on(lance_cuvs::train_ivf_pq(
-            dataset.ds.as_ref(),
-            column,
-            num_partitions as usize,
-            distance_type,
-            num_sub_vectors as usize,
-            sample_rate as usize,
-            max_iters as usize,
-            num_bits as usize,
-            filter_nan,
-        ))
-        .infer_error()?;
-    let ivf_centroids = trained.ivf_centroids().clone().into_data().to_pyarrow(py)?;
-    let pq_codebook = trained.pq_codebook().clone().into_data().to_pyarrow(py)?;
-    Ok((
-        Py::new(py, PyCuvsIvfPqIndex { inner: trained })?,
-        ivf_centroids,
-        pq_codebook,
-    ))
-}
-
-#[cfg(feature = "cuvs")]
-#[pyfunction]
-#[pyo3(signature=(dataset, column, trained_index, artifact_root, batch_size=1024 * 128, filter_nan=true))]
-fn _assign_ivf_pq_on_cuvs_rust(
-    py: Python<'_>,
-    dataset: &Dataset,
-    column: &str,
-    trained_index: &PyCuvsIvfPqIndex,
-    artifact_root: &str,
-    batch_size: usize,
-    filter_nan: bool,
-) -> PyResult<Vec<String>> {
-    let _ = py;
-    rt().runtime
-        .block_on(lance_cuvs::assign_ivf_pq_to_artifact(
-            dataset.ds.as_ref(),
-            column,
-            &trained_index.inner,
-            artifact_root,
-            batch_size,
-            filter_nan,
-        ))
-        .infer_error()
 }
 
 /// Internal helper to fetch an IVF model for the given index name.
@@ -801,12 +716,6 @@ pub fn register_indices(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     indices.add_class::<PyIndexDescription>()?;
     indices.add_class::<PyIndexSegmentDescription>()?;
     indices.add_wrapped(wrap_pyfunction!(get_ivf_model))?;
-    #[cfg(feature = "cuvs")]
-    {
-        indices.add_class::<PyCuvsIvfPqIndex>()?;
-        indices.add_wrapped(wrap_pyfunction!(_train_ivf_pq_on_cuvs_rust))?;
-        indices.add_wrapped(wrap_pyfunction!(_assign_ivf_pq_on_cuvs_rust))?;
-    }
     m.add_submodule(&indices)?;
     Ok(())
 }
