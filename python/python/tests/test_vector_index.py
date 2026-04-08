@@ -9,9 +9,11 @@ import shutil
 import string
 import tempfile
 import time
+from pathlib import Path
 from typing import Optional
 
 import lance
+import lance.cuvs as lance_cuvs
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -534,11 +536,20 @@ def test_create_index_accelerator_fallback(tmp_path, caplog):
     )
 
 
-def test_create_index_rejects_cuvs_accelerator(tmp_path):
+def test_create_index_requires_external_cuvs_backend(tmp_path, monkeypatch):
     tbl = create_table()
     dataset = lance.write_dataset(tbl, tmp_path)
+    original_import_module = lance_cuvs.import_module
 
-    with pytest.raises(ValueError, match="not built into Lance"):
+    def _raise_missing(name):
+        if name == "lance_cuvs":
+            raise ModuleNotFoundError("No module named 'lance_cuvs'")
+        return original_import_module(name)
+
+    monkeypatch.setattr(lance_cuvs, "import_module", _raise_missing)
+    with pytest.raises(
+        ModuleNotFoundError, match="requires the external 'lance-cuvs' package"
+    ):
         dataset.create_index(
             "vector",
             index_type="IVF_PQ",
@@ -548,18 +559,142 @@ def test_create_index_rejects_cuvs_accelerator(tmp_path):
         )
 
 
-def test_prepare_global_ivf_pq_rejects_cuvs_accelerator(tmp_path):
+class _FakeCuvsTraining:
+    def __init__(self, ivf_centroids, pq_codebook):
+        self._ivf_centroids = ivf_centroids
+        self._pq_codebook = pq_codebook
+
+    def ivf_centroids(self):
+        return self._ivf_centroids
+
+    def pq_codebook(self):
+        return self._pq_codebook
+
+
+class _FakeCuvsArtifact:
+    def __init__(self, artifact_uri, files):
+        self.artifact_uri = artifact_uri
+        self.files = files
+
+
+def _make_fake_cuvs_training(num_partitions: int = 4, dimension: int = 128):
+    centroids = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.arange(num_partitions * dimension, dtype=np.float32)),
+        dimension,
+    )
+    codebook = pa.FixedSizeListArray.from_arrays(
+        pa.array(np.arange(16 * 256 * 8, dtype=np.float32)),
+        8,
+    )
+    return _FakeCuvsTraining(centroids, codebook)
+
+
+def test_build_vector_index_on_cuvs_delegates_to_external_backend(tmp_path, monkeypatch):
     ds = _make_sample_dataset_base(tmp_path, "prepare_ivf_pq_cuvs_ds", 512, 128)
-    builder = IndicesBuilder(ds, "vector")
-    with pytest.raises(ValueError, match="not built into Lance"):
-        builder.prepare_global_ivf_pq(
-            num_partitions=4,
-            num_subvectors=16,
-            distance_type="l2",
-            accelerator="cuvs",
+    calls = {}
+    training = _make_fake_cuvs_training()
+
+    class _FakeBackend:
+        def train_ivf_pq(self, dataset_uri, column, **kwargs):
+            calls["train"] = {
+                "dataset_uri": dataset_uri,
+                "column": column,
+                **kwargs,
+            }
+            return training
+
+        def build_ivf_pq_artifact(self, dataset_uri, column, **kwargs):
+            calls["build"] = {
+                "dataset_uri": dataset_uri,
+                "column": column,
+                **kwargs,
+            }
+            return _FakeCuvsArtifact(
+                artifact_uri=str(tmp_path / "artifact"),
+                files=[str(tmp_path / "artifact" / "data.lance")],
+            )
+
+    monkeypatch.setattr(lance_cuvs, "_require_lance_cuvs", lambda: _FakeBackend())
+
+    artifact_uri, files, ivf_centroids, pq_codebook = (
+        lance_cuvs.build_vector_index_on_cuvs(
+            ds,
+            "vector",
+            "l2",
+            "cuvs",
+            4,
+            16,
+            dst_dataset_uri=tmp_path / "artifact_root",
             sample_rate=7,
             max_iters=20,
+            num_bits=4,
+            batch_size=4096,
+            filter_nan=False,
         )
+    )
+
+    assert calls["train"] == {
+        "dataset_uri": ds.uri,
+        "column": "vector",
+        "metric_type": "l2",
+        "num_partitions": 4,
+        "num_sub_vectors": 16,
+        "sample_rate": 7,
+        "max_iters": 20,
+        "num_bits": 4,
+        "filter_nan": False,
+    }
+    assert calls["build"]["dataset_uri"] == ds.uri
+    assert calls["build"]["column"] == "vector"
+    assert calls["build"]["training"] is training
+    assert calls["build"]["artifact_uri"] == str(tmp_path / "artifact_root")
+    assert calls["build"]["batch_size"] == 4096
+    assert calls["build"]["filter_nan"] is False
+    assert artifact_uri == str(tmp_path / "artifact")
+    assert files == [str(tmp_path / "artifact" / "data.lance")]
+    assert ivf_centroids.equals(training.ivf_centroids())
+    assert pq_codebook.equals(training.pq_codebook())
+
+
+def test_prepare_global_ivf_pq_delegates_to_external_cuvs_backend(tmp_path, monkeypatch):
+    ds = _make_sample_dataset_base(tmp_path, "prepare_ivf_pq_cuvs_ds", 512, 128)
+    builder = IndicesBuilder(ds, "vector")
+    training = _make_fake_cuvs_training()
+    calls = {}
+
+    class _FakeBackend:
+        def train_ivf_pq(self, dataset_uri, column, **kwargs):
+            calls["train"] = {
+                "dataset_uri": dataset_uri,
+                "column": column,
+                **kwargs,
+            }
+            return training
+
+    monkeypatch.setattr(lance_cuvs, "_require_lance_cuvs", lambda: _FakeBackend())
+
+    prepared = builder.prepare_global_ivf_pq(
+        num_partitions=4,
+        num_subvectors=16,
+        distance_type="l2",
+        accelerator="cuvs",
+        sample_rate=7,
+        max_iters=20,
+    )
+
+    assert calls["train"] == {
+        "dataset_uri": ds.uri,
+        "column": "vector",
+        "metric_type": "l2",
+        "num_partitions": 4,
+        "num_sub_vectors": 16,
+        "sample_rate": 7,
+        "max_iters": 20,
+        "num_bits": 8,
+        "filter_nan": True,
+    }
+    assert prepared["ivf_centroids"].equals(training.ivf_centroids())
+    assert prepared["pq_codebook"].equals(training.pq_codebook())
 
 
 def test_create_index_rejects_missing_precomputed_partition_artifact(tmp_path):
