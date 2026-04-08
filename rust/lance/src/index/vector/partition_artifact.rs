@@ -39,6 +39,11 @@ const PARTITION_ARTIFACT_BUCKET_PREFIX: &str = "bucket-";
 const PARTITION_ARTIFACT_FILE_VERSION: &str = "2.2";
 const PARTITION_ARTIFACT_BUCKET_BUFFER_ROWS: usize = 32 * 1024;
 
+/// Top-level manifest for a precomputed partition artifact.
+///
+/// The manifest is intentionally small and JSON-encoded so an external backend
+/// can materialize partition data once and Lance can reopen it later without
+/// understanding any backend-specific details.
 #[derive(Debug, Serialize, Deserialize)]
 struct PartitionArtifactManifest {
     version: u32,
@@ -50,6 +55,11 @@ struct PartitionArtifactManifest {
     partitions: Vec<PartitionArtifactPartition>,
 }
 
+/// Describes where one logical IVF partition lives inside the artifact.
+///
+/// Multiple logical partitions can share the same physical file when they hash
+/// to the same bucket. `ranges` records the row spans within that file that
+/// belong to this partition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PartitionArtifactPartition {
     #[serde(default)]
@@ -60,12 +70,22 @@ struct PartitionArtifactPartition {
     ranges: Vec<PartitionArtifactRange>,
 }
 
+/// A contiguous row range for a partition inside one bucket file.
+///
+/// The builder sorts each finalized bucket by partition id, so a partition is
+/// usually represented by a single range. The type still allows multiple runs
+/// so the reader does not depend on that implementation detail.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PartitionArtifactRange {
     offset: u64,
     num_rows: u64,
 }
 
+/// In-memory staging buffer for one bucket before it is flushed to disk.
+///
+/// Batches arrive grouped arbitrarily by the backend. The builder first
+/// appends rows into per-bucket buffers so it can write larger sequential runs
+/// to temporary files instead of issuing tiny file writes.
 #[derive(Default, Debug)]
 struct BucketBuffer {
     row_ids: Vec<u64>,
@@ -74,15 +94,26 @@ struct BucketBuffer {
 }
 
 impl BucketBuffer {
+    /// Number of staged rows currently buffered for this bucket.
     fn len(&self) -> usize {
         self.row_ids.len()
     }
 
+    /// Whether the bucket currently has any staged rows.
     fn is_empty(&self) -> bool {
         self.row_ids.is_empty()
     }
 }
 
+/// Writes partition-addressable encoded rows for a later Lance finalization.
+///
+/// The builder uses a two-phase layout:
+/// 1. Append arbitrary input batches into temporary bucket files.
+/// 2. Reopen each bucket, sort rows by partition id, and rewrite one finalized
+///    bucket file plus a compact manifest that records per-partition ranges.
+///
+/// This keeps the write path sequential and bounded in memory while still
+/// giving the finalizer efficient partition reads.
 pub struct PartitionArtifactBuilder {
     object_store: Arc<ObjectStore>,
     root_dir: Path,
@@ -96,6 +127,11 @@ pub struct PartitionArtifactBuilder {
 }
 
 impl PartitionArtifactBuilder {
+    /// Create a builder from a URI and optional storage options.
+    ///
+    /// This is the external entry point used by backends that only know an
+    /// artifact URI. It resolves the object store and then delegates to the
+    /// store-aware constructor.
     pub async fn try_new(
         uri: &str,
         num_partitions: usize,
@@ -120,6 +156,12 @@ impl PartitionArtifactBuilder {
         Self::try_new_with_store(object_store, root_dir, num_partitions, pq_code_width)
     }
 
+    /// Create a builder against an already-resolved object store.
+    ///
+    /// The builder precomputes the temporary and final schemas and allocates
+    /// one staging buffer per bucket. Buckets are a write-time sharding scheme:
+    /// they are not visible to readers, but they keep memory usage bounded and
+    /// avoid one file per partition.
     pub fn try_new_with_store(
         object_store: Arc<ObjectStore>,
         root_dir: Path,
@@ -177,6 +219,11 @@ impl PartitionArtifactBuilder {
         })
     }
 
+    /// Append one encoded batch into the artifact staging area.
+    ///
+    /// Input batches must already contain row ids, partition ids, and PQ codes.
+    /// Rows are redistributed into bucket-local in-memory buffers and flushed to
+    /// temporary files once they become large enough.
     pub async fn append_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         validate_input_batch(batch, self.pq_code_width)?;
 
@@ -210,6 +257,11 @@ impl PartitionArtifactBuilder {
         Ok(())
     }
 
+    /// Finalize the artifact and return the relative files that were created.
+    ///
+    /// Finalization flushes all remaining staging buffers, rewrites each bucket
+    /// into its final sorted form, and emits a manifest that lets Lance reopen
+    /// the artifact as a [`ShuffleReader`].
     pub async fn finish(
         &mut self,
         metadata_file: &str,
@@ -259,6 +311,12 @@ impl PartitionArtifactBuilder {
         Ok(files)
     }
 
+    /// Flush the current in-memory buffer for one bucket into its temporary
+    /// file.
+    ///
+    /// Temporary files preserve the original row order inside the bucket. The
+    /// expensive partition sort is deferred to `finalize_bucket`, so append-time
+    /// stays cheap.
     async fn flush_bucket(&mut self, bucket_id: usize) -> Result<()> {
         if self.buffers[bucket_id].is_empty() {
             return Ok(());
@@ -270,6 +328,8 @@ impl PartitionArtifactBuilder {
         Ok(())
     }
 
+    /// Convert a bucket's staged vectors into a temporary batch and empty the
+    /// in-memory buffer.
     fn take_temp_batch(&mut self, bucket_id: usize) -> Result<RecordBatch> {
         let buffer = &mut self.buffers[bucket_id];
         let row_ids = UInt64Array::from(mem::take(&mut buffer.row_ids));
@@ -284,6 +344,10 @@ impl PartitionArtifactBuilder {
         .map_err(Error::from)
     }
 
+    /// Lazily create the temporary writer for a bucket.
+    ///
+    /// Buckets that never receive rows never create a file, which keeps sparse
+    /// artifacts compact.
     async fn ensure_temp_writer(&mut self, bucket_id: usize) -> Result<&mut FileWriter> {
         if self.temp_writers[bucket_id].is_none() {
             let path = self.temp_bucket_path(bucket_id);
@@ -299,6 +363,12 @@ impl PartitionArtifactBuilder {
             .expect("temp writer initialized"))
     }
 
+    /// Rewrite one temporary bucket into its final on-disk representation.
+    ///
+    /// All rows for the bucket are loaded, sorted by partition id, and written
+    /// to a single final bucket file that stores only the row id and PQ code.
+    /// The manifest is updated with the row ranges for each partition contained
+    /// in this bucket.
     async fn finalize_bucket(
         &self,
         bucket_id: usize,
@@ -412,6 +482,7 @@ impl PartitionArtifactBuilder {
         Ok(Some(final_relative_path))
     }
 
+    /// Path of the temporary file used while accumulating one bucket.
     fn temp_bucket_path(&self, bucket_id: usize) -> Path {
         self.root_dir
             .child(PARTITION_ARTIFACT_PARTITIONS_DIR)
@@ -420,6 +491,7 @@ impl PartitionArtifactBuilder {
             ))
     }
 
+    /// Path of the finalized file for one bucket.
     fn final_bucket_path(&self, bucket_id: usize) -> Path {
         self.root_dir
             .child(PARTITION_ARTIFACT_PARTITIONS_DIR)
@@ -428,6 +500,7 @@ impl PartitionArtifactBuilder {
             ))
     }
 
+    /// Relative path recorded in the manifest for one finalized bucket.
     fn final_bucket_relative_path(&self, bucket_id: usize) -> String {
         format!(
             "{PARTITION_ARTIFACT_PARTITIONS_DIR}/{PARTITION_ARTIFACT_BUCKET_PREFIX}{bucket_id:05}.lance"
@@ -435,6 +508,11 @@ impl PartitionArtifactBuilder {
     }
 }
 
+/// Reopens a partition artifact as a `ShuffleReader`.
+///
+/// The final Lance builder consumes artifacts through the generic
+/// [`ShuffleReader`] interface, so this adapter hides the manifest parsing and
+/// file caching needed to expose partition-local record batch streams.
 #[derive(Debug)]
 pub(crate) struct PartitionArtifactShuffleReader {
     scheduler: Arc<ScanScheduler>,
@@ -444,6 +522,10 @@ pub(crate) struct PartitionArtifactShuffleReader {
     file_readers: Mutex<HashMap<String, Arc<FileReader>>>,
 }
 
+/// Writer options for all files stored inside a partition artifact.
+///
+/// The artifact uses a fixed file version so external backends and Lance
+/// finalization agree on the on-disk layout.
 fn file_writer_options() -> Result<FileWriterOptions> {
     Ok(FileWriterOptions {
         format_version: Some(
@@ -460,6 +542,10 @@ fn file_writer_options() -> Result<FileWriterOptions> {
     })
 }
 
+/// Validate that a backend-produced batch matches the artifact contract.
+///
+/// The builder is intentionally strict here because any schema drift would only
+/// surface much later during finalization.
 fn validate_input_batch(batch: &RecordBatch, pq_code_width: usize) -> Result<()> {
     let Some(row_ids) = batch.column_by_name(ROW_ID) else {
         return Err(Error::invalid_input(format!(
@@ -497,6 +583,7 @@ fn validate_input_batch(batch: &RecordBatch, pq_code_width: usize) -> Result<()>
     }
 }
 
+/// Serialize a small JSON sidecar directly into the object store.
 async fn write_json<T: Serialize>(
     object_store: &ObjectStore,
     path: &Path,
@@ -515,6 +602,7 @@ async fn write_json<T: Serialize>(
 }
 
 impl PartitionArtifactShuffleReader {
+    /// Open an artifact reader from a URI and optional storage options.
     pub(crate) async fn try_open(
         uri: &str,
         storage_options: Option<&HashMap<String, String>>,
@@ -537,6 +625,10 @@ impl PartitionArtifactShuffleReader {
         Self::try_open_with_store(object_store, root_dir).await
     }
 
+    /// Open an artifact reader once the object store has already been resolved.
+    ///
+    /// This reads the manifest once, validates it, and initializes the shared
+    /// scheduler and reader cache used by partition reads.
     async fn try_open_with_store(object_store: Arc<ObjectStore>, root_dir: Path) -> Result<Self> {
         let manifest_path = root_dir.child("manifest.json");
         let manifest_bytes = object_store.read_one_all(&manifest_path).await?;
@@ -574,6 +666,10 @@ impl PartitionArtifactShuffleReader {
         })
     }
 
+    /// Open and cache a file reader for a finalized bucket file.
+    ///
+    /// Multiple logical partitions can point at the same bucket file, so the
+    /// reader cache prevents redundant file opens during finalization.
     async fn open_file_reader(&self, relative_path: &str) -> Result<Arc<FileReader>> {
         if let Some(reader) = self
             .file_readers
@@ -606,6 +702,7 @@ impl PartitionArtifactShuffleReader {
     }
 }
 
+/// Join a manifest-relative path onto the artifact root.
 fn join_relative_path(root_dir: &Path, relative_path: &str) -> Path {
     relative_path
         .split('/')
@@ -615,6 +712,11 @@ fn join_relative_path(root_dir: &Path, relative_path: &str) -> Path {
 
 #[async_trait::async_trait]
 impl ShuffleReader for PartitionArtifactShuffleReader {
+    /// Return a stream over all rows belonging to one logical partition.
+    ///
+    /// The manifest already records the precise row ranges for each partition,
+    /// so the reader can issue targeted range reads without scanning unrelated
+    /// partitions.
     async fn read_partition(
         &self,
         partition_id: usize,
@@ -659,6 +761,7 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
         ))))
     }
 
+    /// Number of encoded rows available for one logical partition.
     fn partition_size(&self, partition_id: usize) -> Result<usize> {
         Ok(self
             .partitions
@@ -667,6 +770,7 @@ impl ShuffleReader for PartitionArtifactShuffleReader {
             .unwrap_or(0))
     }
 
+    /// Optional training loss propagated from the backend into the artifact.
     fn total_loss(&self) -> Option<f64> {
         self.total_loss
     }
