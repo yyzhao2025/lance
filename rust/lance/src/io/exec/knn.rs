@@ -37,7 +37,10 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
+use lance_core::{
+    ROW_ID_FIELD,
+    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+};
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
@@ -98,6 +101,15 @@ impl AnnIndexMetrics {
             baseline_metrics: BaselineMetrics::new(metrics, partition),
         }
     }
+}
+
+async fn find_partitions_on_cpu(
+    index: Arc<dyn VectorIndex>,
+    query: Query,
+) -> DataFusionResult<(UInt32Array, Float32Array)> {
+    spawn_cpu(move || index.find_partitions(&query))
+        .await
+        .map_err(|e| DataFusionError::Execution(format!("Failed to find partitions: {}", e)))
 }
 
 /// [ExecutionPlan] compute vector distance from a query vector.
@@ -513,9 +525,7 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     let (partitions, dist_q_c) = {
                         let _timer = metrics.find_partitions_elapsed.timer();
-                        index.find_partitions(&query).map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to find partitions: {}", e))
-                        })?
+                        find_partitions_on_cpu(index, query).await?
                     };
 
                     let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
@@ -1356,16 +1366,21 @@ mod tests {
         ArrayRef, FixedSizeListArray, Float32Array, Int32Array, RecordBatchIterator, StringArray,
     };
     use arrow_schema::{Field as ArrowField, Schema as ArrowSchema};
+    use async_trait::async_trait;
+    use deepsize::DeepSizeOf;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_datafusion::exec::{ExecutionStatsCallback, ExecutionSummaryCounts};
     use lance_datafusion::utils::FIND_PARTITIONS_ELAPSED_METRIC;
     use lance_datagen::{BatchCount, RowCount, array};
-    use lance_index::IndexType;
     use lance_index::optimize::OptimizeOptions;
+    use lance_index::prefilter::PreFilter;
     use lance_index::vector::ivf::IvfBuildParams;
     use lance_index::vector::pq::PQBuildParams;
+    use lance_index::{Index, IndexType};
+    use lance_io::traits::Reader;
     use lance_linalg::distance::MetricType;
     use lance_testing::datagen::generate_random_array;
+    use roaring::RoaringBitmap;
     use rstest::rstest;
 
     use crate::dataset::{WriteMode, WriteParams};
@@ -1387,6 +1402,153 @@ mod tests {
             use_index: true,
             dist_q_c: 0.0,
         }
+    }
+
+    #[derive(Debug, DeepSizeOf)]
+    struct ThreadCapturingIndex {
+        thread_name: Arc<Mutex<Option<String>>>,
+        row_ids: Vec<u64>,
+    }
+
+    #[async_trait]
+    impl Index for ThreadCapturingIndex {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn VectorIndex>> {
+            Ok(self)
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::Vector
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait]
+    impl VectorIndex for ThreadCapturingIndex {
+        async fn search(
+            &self,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<RecordBatch> {
+            unimplemented!()
+        }
+
+        fn find_partitions(&self, _query: &Query) -> Result<(UInt32Array, Float32Array)> {
+            let thread_name = std::thread::current()
+                .name()
+                .unwrap_or("unknown")
+                .to_string();
+            *self.thread_name.lock().unwrap() = Some(thread_name);
+            Ok((UInt32Array::from(vec![0]), Float32Array::from(vec![0.0])))
+        }
+
+        fn total_partitions(&self) -> usize {
+            1
+        }
+
+        async fn search_in_partition(
+            &self,
+            _partition_id: usize,
+            _query: &Query,
+            _pre_filter: Arc<dyn PreFilter>,
+            _metrics: &dyn lance_index::metrics::MetricsCollector,
+        ) -> Result<RecordBatch> {
+            unimplemented!()
+        }
+
+        fn is_loadable(&self) -> bool {
+            false
+        }
+
+        fn use_residual(&self) -> bool {
+            false
+        }
+
+        async fn load(
+            &self,
+            _reader: Arc<dyn Reader>,
+            _offset: usize,
+            _length: usize,
+        ) -> Result<Box<dyn VectorIndex>> {
+            unimplemented!()
+        }
+
+        fn num_rows(&self) -> u64 {
+            0
+        }
+
+        fn row_ids(&self) -> Box<dyn Iterator<Item = &'_ u64> + '_> {
+            Box::new(self.row_ids.iter())
+        }
+
+        async fn remap(&mut self, _mapping: &HashMap<u64, Option<u64>>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn to_batch_stream(&self, _with_vector: bool) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
+        }
+
+        fn ivf_model(&self) -> &lance_index::vector::ivf::storage::IvfModel {
+            unimplemented!()
+        }
+
+        fn quantizer(&self) -> lance_index::vector::quantizer::Quantizer {
+            unimplemented!()
+        }
+
+        fn partition_size(&self, _partition_id: usize) -> usize {
+            unimplemented!()
+        }
+
+        fn sub_index_type(
+            &self,
+        ) -> (
+            lance_index::vector::v3::subindex::SubIndexType,
+            lance_index::vector::quantizer::QuantizationType,
+        ) {
+            unimplemented!()
+        }
+
+        fn metric_type(&self) -> DistanceType {
+            DistanceType::L2
+        }
+    }
+
+    #[tokio::test]
+    async fn test_find_partitions_runs_on_cpu_runtime() {
+        let thread_name = Arc::new(Mutex::new(None));
+        let index: Arc<dyn VectorIndex> = Arc::new(ThreadCapturingIndex {
+            thread_name: thread_name.clone(),
+            row_ids: Vec::new(),
+        });
+
+        let (_partitions, _distances) = find_partitions_on_cpu(index, base_query()).await.unwrap();
+
+        let thread_name = thread_name.lock().unwrap().clone().unwrap();
+        assert!(
+            thread_name.contains("lance-cpu"),
+            "expected find_partitions to run on the dedicated cpu runtime, got thread {thread_name}",
+        );
     }
 
     #[test]
