@@ -3,7 +3,6 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::future;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
