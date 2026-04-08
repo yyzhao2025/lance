@@ -20,6 +20,7 @@ use chrono::{Duration, TimeDelta, Utc};
 use futures::{StreamExt, TryFutureExt};
 use lance_index::vector::bq::RQBuildParams;
 use log::error;
+use object_store::path::Path;
 use pyo3::exceptions::{PyStopIteration, PyTypeError};
 use pyo3::types::{PyBytes, PyInt, PyList, PySet, PyString, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
@@ -3624,12 +3625,18 @@ fn prepare_vector_index_params(
             kwargs.get_item("precomputed_shuffle_buffers_path")?,
         ) {
             (Some(l), Some(p)) => {
+                let path = Path::parse(p.to_string()).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "Failed to parse precomputed_shuffle_buffers_path: {}",
+                        e
+                    ))
+                })?;
                 let list = l
                     .downcast::<PyList>()?
                     .iter()
                     .map(|f| f.to_string())
                     .collect();
-                ivf_params.precomputed_shuffle_buffers = Some((p.to_string(), list));
+                ivf_params.precomputed_shuffle_buffers = Some((path, list));
             }
             (None, None) => {}
             _ => {

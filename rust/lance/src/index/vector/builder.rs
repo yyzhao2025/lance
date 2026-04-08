@@ -3,7 +3,6 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
-use std::path::Path as StdPath;
 use std::sync::Arc;
 use std::{collections::HashMap, pin::Pin};
 
@@ -45,10 +44,7 @@ use lance_index::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
 use lance_index::vector::shared::{SupportedIvfIndexType, write_unified_ivf_and_index_metadata};
 use lance_index::vector::storage::STORAGE_METADATA_KEY;
 use lance_index::vector::transform::Flatten;
-use lance_index::vector::v3::shuffler::{
-    EmptyReader, IvfShufflerReader, SHUFFLE_DATA_FILE_NAME, SHUFFLE_OFFSETS_FILE_NAME,
-    TwoFileShuffleReader,
-};
+use lance_index::vector::v3::shuffler::{EmptyReader, IvfShufflerReader};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::{LOSS_METADATA_KEY, PART_ID_COLUMN, PQ_CODE_COLUMN, VectorIndex};
 use lance_index::vector::{PART_ID_FIELD, ivf::storage::IvfModel};
@@ -71,9 +67,7 @@ use lance_index::{
     MIN_PARTITION_SIZE_PERCENT,
 };
 use lance_io::local::to_local_path;
-use lance_io::object_store::{
-    ObjectStore, ObjectStoreParams, ObjectStoreRegistry, StorageOptionsAccessor,
-};
+use lance_io::object_store::ObjectStore;
 use lance_io::stream::RecordBatchStream;
 use lance_io::stream::RecordBatchStreamAdapter;
 use lance_linalg::distance::{DistanceType, Dot, L2, Normalize};
@@ -85,7 +79,6 @@ use tracing::{Level, instrument, span};
 
 use crate::Dataset;
 use crate::dataset::ProjectionRequest;
-use crate::dataset::builder::DatasetBuilder;
 use crate::dataset::index::dataset_format_version;
 use crate::index::vector::ivf::v2::PartitionEntry;
 use crate::index::vector::utils::infer_vector_dim;
@@ -150,83 +143,6 @@ type BuildStream<S, Q> =
     Pin<Box<dyn Stream<Item = Result<Option<(<Q as Quantization>::Storage, S, f64)>>> + Send>>;
 
 impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> {
-    fn precomputed_shuffle_buffers_uri(root: &str) -> String {
-        let uri = root.to_string();
-        if uri.contains("://") {
-            uri
-        } else {
-            to_local_path(&Path::from(root))
-        }
-    }
-
-    fn precomputed_shuffle_buffers_root_uri(root: &str) -> String {
-        let uri = Self::precomputed_shuffle_buffers_uri(root);
-        if uri.ends_with("/data") {
-            uri.trim_end_matches("/data").to_string()
-        } else {
-            uri
-        }
-    }
-
-    fn object_store_params(&self) -> ObjectStoreParams {
-        let mut params = ObjectStoreParams::default();
-        if let Some(storage_options) = self
-            .ivf_params
-            .as_ref()
-            .and_then(|params| params.storage_options.clone())
-        {
-            params.storage_options_accessor = Some(Arc::new(
-                StorageOptionsAccessor::with_static_options(storage_options),
-            ));
-        }
-        params
-    }
-
-    async fn try_open_precomputed_v3_shuffle_reader(
-        &self,
-        root: &str,
-        files: &[String],
-    ) -> Result<Option<Arc<dyn ShuffleReader>>> {
-        if files.len() != 2 {
-            return Ok(None);
-        }
-
-        let mut data_file = None;
-        let mut offsets_file = None;
-        for file in files {
-            let Some(file_name) = StdPath::new(file).file_name() else {
-                return Ok(None);
-            };
-            match file_name.to_string_lossy().as_ref() {
-                SHUFFLE_DATA_FILE_NAME => data_file = Some(SHUFFLE_DATA_FILE_NAME),
-                SHUFFLE_OFFSETS_FILE_NAME => offsets_file = Some(SHUFFLE_OFFSETS_FILE_NAME),
-                _ => return Ok(None),
-            }
-        }
-        let (Some(data_file), Some(offsets_file)) = (data_file, offsets_file) else {
-            return Ok(None);
-        };
-        let registry = Arc::new(ObjectStoreRegistry::default());
-        let params = self.object_store_params();
-        let (object_store, output_dir) = ObjectStore::from_uri_and_params(
-            registry,
-            &Self::precomputed_shuffle_buffers_root_uri(root),
-            &params,
-        )
-        .await?;
-
-        Ok(Some(
-            TwoFileShuffleReader::try_open_existing(
-                object_store,
-                output_dir,
-                data_file,
-                offsets_file,
-            )
-            .await?
-            .into(),
-        ))
-    }
-
     async fn try_open_precomputed_partition_artifact_reader(
         &self,
         uri: &str,
@@ -644,38 +560,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             .as_ref()
             .and_then(|p| p.precomputed_shuffle_buffers.as_ref())
         {
-            Some((uri, files)) => {
-                if let Some(reader) = self
-                    .try_open_precomputed_v3_shuffle_reader(uri, files)
-                    .await?
-                {
-                    log::info!("shuffle with precomputed V3 shuffle files from {}", uri);
-                    self.shuffle_reader = Some(reader);
-                    return Ok(());
-                }
-
-                let uri = Self::precomputed_shuffle_buffers_root_uri(uri);
-                let uri = if StdPath::new(&uri)
-                    .file_name()
-                    .is_some_and(|name| name == "data")
-                {
-                    StdPath::new(&uri)
-                        .parent()
-                        .map(|path| path.to_string_lossy().to_string())
-                        .unwrap_or(uri)
-                } else {
-                    uri
-                };
+            Some((uri, _)) => {
+                let uri = to_local_path(uri);
+                let uri = uri.trim_end_matches("data");
                 log::info!("shuffle with precomputed shuffle buffers from {}", uri);
-                let mut builder = DatasetBuilder::from_uri(&uri);
-                if let Some(storage_options) = self
-                    .ivf_params
-                    .as_ref()
-                    .and_then(|params| params.storage_options.clone())
-                {
-                    builder = builder.with_storage_options(storage_options);
-                }
-                let ds = builder.load().await?;
+                let ds = Dataset::open(uri).await?;
                 ds.scan().try_into_stream().await?
             }
             _ => {
@@ -2523,15 +2412,5 @@ mod tests {
         assert!(batches[0].column_by_name(PART_ID_COLUMN).is_none());
         let row_ids = batches[0][ROW_ID].as_primitive::<UInt64Type>();
         assert_eq!(row_ids.values(), &[4, 3, 2, 1, 0]);
-    }
-
-    #[test]
-    fn precomputed_shuffle_buffer_uri_preserves_remote_uri() {
-        assert_eq!(
-            IvfIndexBuilder::<FlatIndex, FlatQuantizer>::precomputed_shuffle_buffers_root_uri(
-                "s3://bucket/shuffle"
-            ),
-            "s3://bucket/shuffle"
-        );
     }
 }

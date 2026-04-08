@@ -1818,7 +1818,7 @@ async fn write_ivf_pq_file(
     precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
-    precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let path = index_dir.child(uuid).child(INDEX_FILE_NAME);
     let mut writer = object_store.create(&path).await?;
@@ -1911,7 +1911,7 @@ async fn write_ivf_hnsw_file(
     precomputed_partitions: Option<HashMap<u64, u32>>,
     shuffle_partition_batches: usize,
     shuffle_partition_concurrency: usize,
-    precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
+    precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 ) -> Result<()> {
     let object_store = dataset.object_store();
     let path = dataset.indices_dir().child(uuid).child(INDEX_FILE_NAME);

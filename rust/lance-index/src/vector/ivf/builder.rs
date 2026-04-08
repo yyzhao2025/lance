@@ -11,6 +11,7 @@ use arrow_array::{Array, FixedSizeListArray, UInt32Array, UInt64Array};
 use futures::TryStreamExt;
 use lance_core::error::{Error, Result};
 use lance_io::stream::RecordBatchStream;
+use object_store::path::Path;
 
 /// Parameters to build IVF partitions
 #[derive(Debug, Clone)]
@@ -46,7 +47,7 @@ pub struct IvfBuildParams {
     /// requires `centroids` to be set
     ///
     /// The input is expected to be (/dir/to/buffers, [buffer1.lance, buffer2.lance, ...])
-    pub precomputed_shuffle_buffers: Option<(String, Vec<String>)>,
+    pub precomputed_shuffle_buffers: Option<(Path, Vec<String>)>,
 
     /// Precomputed partitioned artifact produced by an external backend.
     /// Mutually exclusive with other precomputed inputs and requires `centroids` to be set.

@@ -372,7 +372,7 @@ impl PartitionLoadLock {
 ///
 /// Handles both regular vector columns (FixedSizeList) and multivector columns
 /// (List\<FixedSizeList\>), flattening the latter.
-pub fn vector_column_to_fsl(batch: &RecordBatch, column: &str) -> Result<FixedSizeListArray> {
+fn vector_column_to_fsl(batch: &RecordBatch, column: &str) -> Result<FixedSizeListArray> {
     let array = get_column_from_batch(batch, column)?;
     match array.data_type() {
         arrow::datatypes::DataType::FixedSizeList(_, _) => Ok(array.as_fixed_size_list().clone()),
