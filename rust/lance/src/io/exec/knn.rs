@@ -37,7 +37,10 @@ use futures::{Stream, StreamExt, TryFutureExt, TryStreamExt, future, stream};
 use itertools::Itertools;
 use lance_core::ROW_ID;
 use lance_core::utils::futures::FinallyStreamExt;
-use lance_core::{ROW_ID_FIELD, utils::tokio::get_num_compute_intensive_cpus};
+use lance_core::{
+    ROW_ID_FIELD,
+    utils::tokio::{get_num_compute_intensive_cpus, spawn_cpu},
+};
 use lance_datafusion::utils::{
     DELTAS_SEARCHED_METRIC, ExecutionPlanMetricsSetExt, FIND_PARTITIONS_ELAPSED_METRIC,
     PARTITIONS_RANKED_METRIC, PARTITIONS_SEARCHED_METRIC,
@@ -513,9 +516,16 @@ impl ExecutionPlan for ANNIvfPartitionExec {
 
                     let (partitions, dist_q_c) = {
                         let _timer = metrics.find_partitions_elapsed.timer();
-                        index.find_partitions(&query).map_err(|e| {
-                            DataFusionError::Execution(format!("Failed to find partitions: {}", e))
-                        })?
+                        let index_for_search = index.clone();
+                        let query_for_search = query.clone();
+                        spawn_cpu(move || index_for_search.find_partitions(&query_for_search))
+                            .await
+                            .map_err(|e| {
+                                DataFusionError::Execution(format!(
+                                    "Failed to find partitions: {}",
+                                    e
+                                ))
+                            })?
                     };
 
                     let mut part_list_builder = ListBuilder::new(UInt32Builder::new())
