@@ -351,6 +351,7 @@ fn convert_to_java_operation_inner<'local>(
     match operation {
         Operation::Append {
             fragments: rust_fragments,
+            ..
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
 
@@ -1090,7 +1091,10 @@ fn convert_to_rust_operation(
                 import_vec_from_method(env, java_operation, "fragments", |env, fragment| {
                     fragment.extract_object(env)
                 })?;
-            Operation::Append { fragments }
+            Operation::Append {
+                fragments,
+                row_ids: None,
+            }
         }
         "Delete" => {
             let updated_fragments: Vec<Fragment> = import_vec_from_method(

@@ -772,7 +772,10 @@ pub fn inner_commit_append<'local>(
     for f in fragment_objs {
         fragments.push(f.extract_object(env)?);
     }
-    let op = Operation::Append { fragments };
+    let op = Operation::Append {
+        fragments,
+        row_ids: None,
+    };
     let path_str = path.extract(env)?;
     let read_version = env.get_u64_opt(&read_version_obj)?;
     let storage_options = extract_storage_options(env, &storage_options_obj)?;

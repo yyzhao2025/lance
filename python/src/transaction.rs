@@ -250,7 +250,10 @@ impl FromPyObject<'_> for PyLance<Operation> {
             }
             "Append" => {
                 let fragments = extract_vec(&ob.getattr("fragments")?)?;
-                let op = Operation::Append { fragments };
+                let op = Operation::Append {
+                    fragments,
+                    row_ids: None,
+                };
                 Ok(Self(op))
             }
             "Delete" => {
@@ -403,7 +406,7 @@ impl<'py> IntoPyObject<'py> for PyLance<&Operation> {
             .expect("Failed to import LanceOperation namespace");
 
         match self.0 {
-            Operation::Append { fragments } => {
+            Operation::Append { fragments, .. } => {
                 let fragments = export_vec(py, fragments.as_slice())?;
                 let cls = namespace
                     .getattr("Append")
