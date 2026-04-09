@@ -32,11 +32,6 @@ message UUID {
   bytes uuid = 1;
 }
 
-message ReservedRowIds {
-  uint64 start_row_id = 1;
-  uint64 num_rows = 2;
-}
-
 // Manifest is a global section shared between all the files.
 message Manifest {
   // All fields of the dataset, including the nested fields.

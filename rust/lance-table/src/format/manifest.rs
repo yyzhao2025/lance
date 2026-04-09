@@ -849,8 +849,8 @@ impl From<BasePath> for pb::BasePath {
     }
 }
 
-impl From<pb::ReservedRowIds> for ReservedRowIds {
-    fn from(value: pb::ReservedRowIds) -> Self {
+impl From<pb::transaction::append::ReservedRowIds> for ReservedRowIds {
+    fn from(value: pb::transaction::append::ReservedRowIds) -> Self {
         Self {
             start_row_id: value.start_row_id,
             num_rows: value.num_rows,
@@ -858,7 +858,7 @@ impl From<pb::ReservedRowIds> for ReservedRowIds {
     }
 }
 
-impl From<&ReservedRowIds> for pb::ReservedRowIds {
+impl From<&ReservedRowIds> for pb::transaction::append::ReservedRowIds {
     fn from(value: &ReservedRowIds) -> Self {
         Self {
             start_row_id: value.start_row_id,

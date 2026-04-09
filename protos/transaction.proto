@@ -35,6 +35,11 @@ message Transaction {
 
   // Add new rows to the dataset.
   message Append {
+    message ReservedRowIds {
+      uint64 start_row_id = 1;
+      uint64 num_rows = 2;
+    }
+
     // The new fragments to append.
     //
     // Fragment IDs are not yet assigned.
@@ -45,7 +50,7 @@ message Transaction {
     // dataset version identified by read_version. Multiple append operations
     // may consume disjoint sub-ranges from the same reservation as long as
     // they continue to reference that reserve version.
-    ReservedRowIds row_ids = 2;
+    optional ReservedRowIds row_ids = 2;
   }
 
   // Mark rows as deleted.

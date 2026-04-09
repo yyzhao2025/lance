@@ -3300,7 +3300,9 @@ impl From<&Transaction> for pb::Transaction {
             Operation::Append { fragments, row_ids } => {
                 pb::transaction::Operation::Append(pb::transaction::Append {
                     fragments: fragments.iter().map(pb::DataFragment::from).collect(),
-                    row_ids: row_ids.as_ref().map(pb::ReservedRowIds::from),
+                    row_ids: row_ids
+                        .as_ref()
+                        .map(pb::transaction::append::ReservedRowIds::from),
                 })
             }
             Operation::Clone {
