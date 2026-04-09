@@ -349,7 +349,7 @@ mod test {
             .unwrap();
 
         let reserved = dataset.latest_reserved_row_ids().await.unwrap().unwrap();
-        assert_eq!(dataset.reserved_row_ids(), &[reserved.clone()]);
+        assert_eq!(dataset.reserved_row_ids(), std::slice::from_ref(&reserved));
 
         let append_params = WriteParams {
             mode: WriteMode::Append,
