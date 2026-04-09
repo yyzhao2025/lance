@@ -54,15 +54,15 @@ impl<'a> CommitBuilder<'a> {
         dest: &WriteDestination<'_>,
         transaction: &Transaction,
     ) -> Result<()> {
-        let (dataset, requested) = match (dest.dataset(), &transaction.operation) {
-            (
-                Some(dataset),
-                Operation::Append {
-                    row_ids: Some(requested),
-                    ..
-                },
-            ) => (dataset, requested),
-            _ => return Ok(()),
+        let (
+            Some(dataset),
+            Operation::Append {
+                row_ids: Some(requested),
+                ..
+            },
+        ) = (dest.dataset(), &transaction.operation)
+        else {
+            return Ok(());
         };
 
         let base_dataset = if dataset.manifest.version == transaction.read_version {
