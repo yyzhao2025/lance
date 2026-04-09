@@ -54,13 +54,14 @@ impl<'a> CommitBuilder<'a> {
         dest: &WriteDestination<'_>,
         transaction: &Transaction,
     ) -> Result<()> {
-        let (
-            Some(dataset),
-            Operation::Append {
-                row_ids: Some(requested),
-                ..
-            },
-        ) = (dest.dataset(), &transaction.operation)
+        let Some(dataset) = dest.dataset() else {
+            return Ok(());
+        };
+
+        let Operation::Append {
+            row_ids: Some(requested_row_ids),
+            ..
+        } = &transaction.operation
         else {
             return Ok(());
         };
@@ -71,42 +72,46 @@ impl<'a> CommitBuilder<'a> {
             dataset.checkout_version(transaction.read_version).await?
         };
 
-        let Some(base_reserved) = base_dataset.reserved_row_ids().await? else {
+        let Some(reserved_row_ids) = base_dataset.reserved_row_ids().await? else {
             return Err(Error::invalid_input(format!(
                 "Append row ids require read_version {} to be a ReserveRowIds transaction",
                 transaction.read_version
             )));
         };
 
-        let requested_end = requested
+        let requested_end_row_id = requested_row_ids
             .start_row_id
-            .checked_add(requested.num_rows)
+            .checked_add(requested_row_ids.num_rows)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Requested row ids overflow: start_row_id={}, num_rows={}",
-                    requested.start_row_id, requested.num_rows
+                    requested_row_ids.start_row_id, requested_row_ids.num_rows
                 ))
             })?;
-        let reserved_end = base_reserved
+        let reserved_end_row_id = reserved_row_ids
             .start_row_id
-            .checked_add(base_reserved.num_rows)
+            .checked_add(reserved_row_ids.num_rows)
             .ok_or_else(|| {
                 Error::invalid_input(format!(
                     "Reserved row ids overflow: start_row_id={}, num_rows={}",
-                    base_reserved.start_row_id, base_reserved.num_rows
+                    reserved_row_ids.start_row_id, reserved_row_ids.num_rows
                 ))
             })?;
 
-        if base_reserved.start_row_id <= requested.start_row_id && requested_end <= reserved_end {
+        let requested_within_reserved = reserved_row_ids.start_row_id
+            <= requested_row_ids.start_row_id
+            && requested_end_row_id <= reserved_end_row_id;
+
+        if requested_within_reserved {
             Ok(())
         } else {
             Err(Error::invalid_input(format!(
                 "Requested row ids start_row_id={} num_rows={} are not contained within the read_version {} reservation start_row_id={} num_rows={}",
-                requested.start_row_id,
-                requested.num_rows,
+                requested_row_ids.start_row_id,
+                requested_row_ids.num_rows,
                 transaction.read_version,
-                base_reserved.start_row_id,
-                base_reserved.num_rows
+                reserved_row_ids.start_row_id,
+                reserved_row_ids.num_rows
             )))
         }
     }

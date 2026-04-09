@@ -421,25 +421,25 @@ impl Dataset {
             return Ok(None);
         };
 
-        match transaction.operation {
-            Operation::ReserveRowIds { num_rows } => {
-                let start_row_id =
-                    self.manifest
-                        .next_row_id
-                        .checked_sub(num_rows)
-                        .ok_or_else(|| {
-                            Error::internal(format!(
-                                "Manifest next_row_id={} is smaller than reserved num_rows={}",
-                                self.manifest.next_row_id, num_rows
-                            ))
-                        })?;
-                Ok(Some(ReservedRowIds {
-                    start_row_id,
-                    num_rows,
-                }))
-            }
-            _ => Ok(None),
-        }
+        let Operation::ReserveRowIds { num_rows } = transaction.operation else {
+            return Ok(None);
+        };
+
+        let start_row_id = self
+            .manifest
+            .next_row_id
+            .checked_sub(num_rows)
+            .ok_or_else(|| {
+                Error::internal(format!(
+                    "Manifest next_row_id={} is smaller than reserved num_rows={}",
+                    self.manifest.next_row_id, num_rows
+                ))
+            })?;
+
+        Ok(Some(ReservedRowIds {
+            start_row_id,
+            num_rows,
+        }))
     }
 
     /// Open an existing dataset.
