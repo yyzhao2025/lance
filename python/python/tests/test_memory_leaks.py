@@ -84,12 +84,11 @@ class TestMemoryLeaks:
         data = pa.table({"id": [1]})
         ds = lance.write_dataset(data, dataset_path)
         ds.create_scalar_index("id", index_type="BTREE")
-        index_names = [idx.name for idx in ds.describe_indices()]
 
         def access_index_stats() -> None:
             d = lance.dataset(dataset_path)
-            for index_name in index_names:
-                d.stats.index_stats(index_name)
+            for idx in d.describe_indices():
+                d.stats.index_stats(idx.name)
 
         assert_noleaks(
             access_index_stats, iterations=1000, threshold_mb=2.0, check_interval=25
