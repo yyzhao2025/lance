@@ -2499,6 +2499,44 @@ def test_index_prewarm(tmp_path: Path):
         ds.prewarm_index("fts_idx", True)
 
 
+def test_index_prewarm_with_v2_phrase_query_remainder(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LANCE_FTS_FORMAT_VERSION", "2")
+
+    test_table_size = 133
+    phrase_doc = "alpha beta alpha gamma alpha"
+    query = PhraseQuery("alpha beta alpha", "fts")
+
+    ds = lance.write_dataset(
+        pa.table(
+            {
+                "id": list(range(test_table_size)),
+                "fts": [phrase_doc for _ in range(test_table_size)],
+            }
+        ),
+        tmp_path,
+    )
+    ds.create_scalar_index(
+        "fts",
+        index_type="INVERTED",
+        with_position=True,
+        remove_stop_words=False,
+    )
+
+    ds = lance.dataset(tmp_path)
+    direct_results = ds.to_table(full_text_query=query)
+    assert direct_results.num_rows == test_table_size
+    assert set(direct_results["id"].to_pylist()) == set(range(test_table_size))
+
+    ds = lance.dataset(tmp_path)
+    ds.prewarm_index("fts_idx", with_position=True)
+    cache_entries_after_prewarm = ds._ds.index_cache_entry_count()
+
+    cached_results = ds.to_table(full_text_query=query)
+    assert cached_results.num_rows == test_table_size
+    assert set(cached_results["id"].to_pylist()) == set(range(test_table_size))
+    assert ds._ds.index_cache_entry_count() == cache_entries_after_prewarm
+
+
 def test_btree_prewarm(tmp_path: Path):
     scan_stats = None
 
