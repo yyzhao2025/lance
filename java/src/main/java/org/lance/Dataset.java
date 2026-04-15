@@ -24,6 +24,7 @@ import org.lance.index.IndexOptions;
 import org.lance.index.IndexParams;
 import org.lance.index.IndexType;
 import org.lance.index.OptimizeOptions;
+import org.lance.index.scalar.ZoneStats;
 import org.lance.ipc.DataStatistics;
 import org.lance.ipc.LanceScanner;
 import org.lance.ipc.ScanOptions;
@@ -150,7 +151,9 @@ public class Dataset implements Closeable {
               params.getEnableV2ManifestPaths(),
               params.getStorageOptions(),
               params.getInitialBases(),
-              params.getTargetBases());
+              params.getTargetBases(),
+              params.getAllowExternalBlobOutsideBases(),
+              params.getBlobPackFileSizeThreshold());
       dataset.allocator = allocator;
       return dataset;
     }
@@ -196,7 +199,9 @@ public class Dataset implements Closeable {
       Optional<Boolean> enableV2ManifestPaths,
       Map<String, String> storageOptions,
       Optional<List<BasePath>> initialBases,
-      Optional<List<String>> targetBases);
+      Optional<List<String>> targetBases,
+      Optional<Boolean> allowExternalBlobOutsideBases,
+      Optional<Long> blobPackFileSizeThreshold);
 
   /**
    * Creates a dataset from an FFI arrow stream.
@@ -231,6 +236,8 @@ public class Dataset implements Closeable {
       Map<String, String> storageOptions,
       Optional<List<BasePath>> initialBases,
       Optional<List<String>> targetBases,
+      Optional<Boolean> allowExternalBlobOutsideBases,
+      Optional<Long> blobPackFileSizeThreshold,
       LanceNamespace namespaceClient,
       List<String> tableId,
       boolean namespaceClientManagedVersioning);
@@ -280,6 +287,8 @@ public class Dataset implements Closeable {
             params.getStorageOptions(),
             params.getInitialBases(),
             params.getTargetBases(),
+            params.getAllowExternalBlobOutsideBases(),
+            params.getBlobPackFileSizeThreshold(),
             namespaceClient,
             tableId,
             namespaceClientManagedVersioning);
@@ -1315,6 +1324,29 @@ public class Dataset implements Closeable {
   }
 
   private native List<IndexDescription> nativeDescribeIndices(Optional<IndexCriteria> criteria);
+
+  /**
+   * Read zonemap statistics for a column.
+   *
+   * <p>Returns per-zone min/max/null_count statistics for the given column, if a zonemap index
+   * exists. Returns an empty list if no zonemap index exists for the column.
+   *
+   * <p>The zonemap index file is typically small (one row per zone), so this is a lightweight
+   * metadata-only operation suitable for calling on the driver during scan planning.
+   *
+   * @param columnName the column name
+   * @return list of per-zone statistics, ordered by (fragment_id, zone_start)
+   */
+  public List<ZoneStats> getZonemapStats(String columnName) {
+    Preconditions.checkArgument(
+        columnName != null && !columnName.isEmpty(), "columnName cannot be null or empty");
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetZonemapStats(columnName);
+    }
+  }
+
+  private native List<ZoneStats> nativeGetZonemapStats(String columnName);
 
   /**
    * Get the table config of the dataset.
