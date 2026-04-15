@@ -647,7 +647,9 @@ def _make_fake_cuvs_training(num_partitions: int = 4, dimension: int = 128):
     return _FakeCuvsTraining(centroids, codebook)
 
 
-def test_build_vector_index_on_cuvs_delegates_to_external_backend(tmp_path, monkeypatch):
+def test_build_vector_index_on_cuvs_delegates_to_external_backend(
+    tmp_path, monkeypatch
+):
     ds = _make_sample_dataset_base(tmp_path, "prepare_ivf_pq_cuvs_ds", 512, 128)
     calls = {}
     training = _make_fake_cuvs_training()
@@ -717,7 +719,9 @@ def test_build_vector_index_on_cuvs_delegates_to_external_backend(tmp_path, monk
     assert pq_codebook.equals(training.pq_codebook())
 
 
-def test_prepare_global_ivf_pq_delegates_to_external_cuvs_backend(tmp_path, monkeypatch):
+def test_prepare_global_ivf_pq_delegates_to_external_cuvs_backend(
+    tmp_path, monkeypatch
+):
     ds = _make_sample_dataset_base(tmp_path, "prepare_ivf_pq_cuvs_ds", 512, 128)
     builder = IndicesBuilder(ds, "vector")
     ds._storage_options = {"region": "us-east-1"}
@@ -773,7 +777,9 @@ def test_require_lance_cuvs_rejects_incompatible_backend(monkeypatch):
 
 
 def test_create_index_rejects_missing_precomputed_partition_artifact(tmp_path):
-    dataset = lance.write_dataset(create_table(nvec=64, ndim=128), tmp_path / "artifact_src")
+    dataset = lance.write_dataset(
+        create_table(nvec=64, ndim=128), tmp_path / "artifact_src"
+    )
 
     with pytest.raises(Exception):
         dataset.create_index(

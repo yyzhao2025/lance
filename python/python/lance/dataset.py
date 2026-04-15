@@ -3194,19 +3194,21 @@ class LanceDataset(pa.dataset.Dataset):
 
                 LOGGER.info("Doing cuVS vector backend build")
                 timers["ivf+pq_build:start"] = time.time()
-                artifact_root, _, ivf_centroids, pq_codebook = build_vector_index_on_cuvs(
-                    self,
-                    column[0],
-                    metric,
-                    accelerator,
-                    num_partitions,
-                    num_sub_vectors,
-                    storage_options=storage_options,
-                    sample_rate=kwargs.get("sample_rate", 256),
-                    max_iters=kwargs.get("max_iters", 50),
-                    num_bits=kwargs.get("num_bits", 8),
-                    batch_size=1024 * 128,
-                    filter_nan=filter_nan,
+                artifact_root, _, ivf_centroids, pq_codebook = (
+                    build_vector_index_on_cuvs(
+                        self,
+                        column[0],
+                        metric,
+                        accelerator,
+                        num_partitions,
+                        num_sub_vectors,
+                        storage_options=storage_options,
+                        sample_rate=kwargs.get("sample_rate", 256),
+                        max_iters=kwargs.get("max_iters", 50),
+                        num_bits=kwargs.get("num_bits", 8),
+                        batch_size=1024 * 128,
+                        filter_nan=filter_nan,
+                    )
                 )
                 kwargs["precomputed_partition_artifact_uri"] = artifact_root
                 timers["ivf+pq_build:end"] = time.time()
@@ -3243,15 +3245,17 @@ class LanceDataset(pa.dataset.Dataset):
                 )
                 LOGGER.info("ivf+pq training time: %ss", ivfpq_train_time)
                 timers["ivf+pq_assign:start"] = time.time()
-                shuffle_output_dir, shuffle_buffers = one_pass_assign_ivf_pq_on_accelerator(
-                    self,
-                    column[0],
-                    metric,
-                    accelerator,
-                    ivf_kmeans,
-                    pq_kmeans_list,
-                    batch_size=20480,
-                    filter_nan=filter_nan,
+                shuffle_output_dir, shuffle_buffers = (
+                    one_pass_assign_ivf_pq_on_accelerator(
+                        self,
+                        column[0],
+                        metric,
+                        accelerator,
+                        ivf_kmeans,
+                        pq_kmeans_list,
+                        batch_size=20480,
+                        filter_nan=filter_nan,
+                    )
                 )
                 timers["ivf+pq_assign:end"] = time.time()
                 ivfpq_assign_time = (
@@ -3422,7 +3426,8 @@ class LanceDataset(pa.dataset.Dataset):
             kwargs["precomputed_partition_artifact_uri"]
         ):
             LOGGER.info(
-                "Temporary precomputed partition artifact stored at %s, you may want to delete it.",
+                "Temporary precomputed partition artifact stored at %s; "
+                "you may want to delete it.",
                 kwargs["precomputed_partition_artifact_uri"],
             )
         return index

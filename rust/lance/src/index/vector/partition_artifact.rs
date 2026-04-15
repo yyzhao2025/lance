@@ -682,7 +682,7 @@ mod tests {
     use std::fs;
 
     use arrow_array::cast::AsArray;
-    use arrow_array::{FixedSizeListArray, RecordBatch, UInt8Array, UInt64Array};
+    use arrow_array::{FixedSizeListArray, RecordBatch, UInt8Array, UInt32Array, UInt64Array};
     use futures::TryStreamExt;
     use lance_arrow::FixedSizeListArrayExt;
     use lance_core::ROW_ID;
