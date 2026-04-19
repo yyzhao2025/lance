@@ -94,11 +94,13 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      # pin the toolchain version to avoid surprises
+      # pin the nightly toolchain to avoid breakage from upstream crates
+      # (ethnum 1.5.2 fails to compile on nightly >= 2026-03-01 due to
+      # TryFromIntError layout change)
       - name: Setup rust toolchain
         run: |
-          rustup toolchain install nightly
-          rustup default nightly
+          rustup toolchain install nightly-2026-03-31
+          rustup default nightly-2026-03-31
       - uses: rui314/setup-mold@725a8794d15fc7563f59595bd9556495c0564878 # v1
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
       - name: Install dependencies
