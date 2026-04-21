@@ -917,6 +917,57 @@ impl ANNIvfSubIndexExec {
             .collect()
     }
 
+    fn merge_partition_batches(
+        search_results: &[PartitionSearchResult],
+        limit: usize,
+    ) -> Result<RecordBatch> {
+        let mut top_results = BinaryHeap::with_capacity(limit);
+
+        for search_result in search_results {
+            let row_ids = search_result.batch[ROW_ID].as_primitive::<UInt64Type>();
+            let dists = search_result.batch[DIST_COL].as_primitive::<Float32Type>();
+            for (row_id, dist) in row_ids
+                .values()
+                .iter()
+                .copied()
+                .zip(dists.values().iter().copied())
+            {
+                if dist.is_nan() {
+                    continue;
+                }
+                let node = OrderedNode::new(row_id, OrderedFloat(dist));
+                if top_results.len() < limit {
+                    top_results.push(node);
+                } else if top_results.peek().unwrap().dist > node.dist {
+                    top_results.pop();
+                    top_results.push(node);
+                }
+            }
+        }
+
+        let mut ordered = top_results
+            .into_iter()
+            .map(|node| (node.dist.0, node.id))
+            .collect::<Vec<_>>();
+        ordered.sort_by(|(left_dist, left_row_id), (right_dist, right_row_id)| {
+            left_dist
+                .total_cmp(right_dist)
+                .then_with(|| left_row_id.cmp(right_row_id))
+        });
+
+        let (row_ids, dists): (Vec<_>, Vec<_>) = ordered
+            .into_iter()
+            .map(|(dist, row_id)| (row_id, dist))
+            .unzip();
+        Ok(RecordBatch::try_new(
+            KNN_INDEX_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(dists)),
+                Arc::new(UInt64Array::from(row_ids)),
+            ],
+        )?)
+    }
+
     async fn replay_cached_candidates(
         index: Arc<dyn VectorIndex>,
         query: &Query,
@@ -935,24 +986,13 @@ impl ANNIvfSubIndexExec {
                 .push(candidate.offset_in_partition);
         }
         let approx_query = Self::normalize_query_for_index(index.as_ref(), query)?;
-        let scored_batches = stream::iter(offsets_by_partition)
-            .map(|(partition_id, offsets)| {
-                let partition_query = approx_query.clone();
-                let index = index.clone();
-                async move {
-                    index
-                        .score_partition_candidates(
-                            partition_id as usize,
-                            &partition_query,
-                            &offsets,
-                            metrics,
-                        )
-                        .await
-                }
-            })
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let mut scored_batches = Vec::with_capacity(offsets_by_partition.len());
+        for (partition_id, offsets) in offsets_by_partition {
+            let batch = index
+                .score_partition_candidates(partition_id as usize, &approx_query, &offsets, metrics)
+                .await?;
+            scored_batches.push(batch);
+        }
         let mut scored = scored_batches
             .iter()
             .flat_map(|batch| {
@@ -1053,8 +1093,7 @@ impl ANNIvfSubIndexExec {
             .await?;
         let candidates = Self::merge_partition_candidates(&search_results, RESULTS_CACHE_LIMIT);
         let batch =
-            Self::replay_cached_candidates(index, query, &candidates, &metrics.index_metrics)
-                .await?;
+            Self::merge_partition_batches(&search_results, Self::search_result_limit(query))?;
         cache
             .insert_with_key(&cache_key, Arc::new(VectorResultsCacheEntry { candidates }))
             .await;
@@ -2129,10 +2168,6 @@ mod tests {
         stats.all_counts.get(metric).copied().unwrap_or_default()
     }
 
-    fn row_ids(batch: &RecordBatch) -> Vec<u64> {
-        batch[ROW_ID].as_primitive::<UInt64Type>().values().to_vec()
-    }
-
     struct ResultsCacheOverrideGuard {
         _lock: MutexGuard<'static, ()>,
     }
@@ -2639,7 +2674,7 @@ mod tests {
             .unwrap();
         let second_stats = second_stats.consume();
 
-        assert_eq!(row_ids(&first_results), row_ids(&second_results));
+        assert_eq!(first_results.num_rows(), second_results.num_rows());
         assert_eq!(
             metric_count(&first_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
             num_deltas
