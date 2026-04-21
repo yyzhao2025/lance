@@ -11,7 +11,7 @@ use crate::index::vector::{IndexFileVersion, builder::index_type_string};
 use crate::index::{PreFilter, vector::VectorIndex};
 use arrow::compute::concat_batches;
 use arrow_arith::numeric::sub;
-use arrow_array::{Float32Array, RecordBatch, UInt32Array, UInt64Array};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array};
 use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -19,8 +19,8 @@ use deepsize::DeepSizeOf;
 use futures::future::BoxFuture;
 use futures::prelude::stream::{self, TryStreamExt};
 use futures::{StreamExt, TryFutureExt};
-use lance_arrow::RecordBatchExt;
 use lance_arrow::ipc::write_len_prefixed_bytes;
+use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
 use lance_core::cache::{CacheCodec, CacheCodecImpl, CacheKey, LanceCache, WeakLanceCache};
 use lance_core::utils::tokio::spawn_cpu;
 use lance_core::utils::tracing::{IO_TYPE_LOAD_VECTOR_PART, TRACE_IO_EVENTS};
@@ -769,6 +769,24 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
         }
     }
 
+    fn query_centroid_distance(&self, partition_id: usize, query: &Query) -> Result<f32> {
+        let centroid = self.ivf.centroid(partition_id).ok_or_else(|| {
+            Error::index(format!(
+                "partition centroid {} does not exist",
+                partition_id
+            ))
+        })?;
+        let centroid_batch =
+            FixedSizeListArray::try_new_from_values(centroid.clone(), centroid.len() as i32)?;
+        let distance_type = if self.distance_type == DistanceType::Cosine {
+            DistanceType::L2
+        } else {
+            self.distance_type
+        };
+        let dists = distance_type.arrow_batch_func()(query.key.as_ref(), &centroid_batch)?;
+        Ok(dists.value(0))
+    }
+
     /// Export the index state needed for reconstruction from a disk cache.
     pub(crate) fn to_state_entry(&self) -> IvfStateEntryBox {
         let (sub_index_type, quantization_type) = self.sub_index_type();
@@ -1053,7 +1071,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch> {
         let part_entry = self.load_partition(partition_id, true, metrics).await?;
-        let query = self.preprocess_query(partition_id, query)?;
+        let mut query = query.clone();
+        query.dist_q_c = self.query_centroid_distance(partition_id, &query)?;
+        let query = self.preprocess_query(partition_id, &query)?;
         let offsets_in_partition = offsets_in_partition.to_vec();
         let (batch, local_metrics) = spawn_cpu(move || {
             let local_metrics = LocalMetricsCollector::default();

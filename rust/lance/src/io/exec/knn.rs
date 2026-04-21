@@ -921,20 +921,12 @@ impl ANNIvfSubIndexExec {
         index: Arc<dyn VectorIndex>,
         query: &Query,
         candidates: &[PartitionSearchCandidate],
-        partitions: &UInt32Array,
-        q_c_dists: &Float32Array,
         metrics: &dyn lance_index::metrics::MetricsCollector,
     ) -> Result<RecordBatch> {
         if candidates.is_empty() {
             return Ok(RecordBatch::new_empty(KNN_INDEX_SCHEMA.clone()));
         }
 
-        let q_c_dist_by_partition = partitions
-            .values()
-            .iter()
-            .copied()
-            .zip(q_c_dists.values().iter().copied())
-            .collect::<HashMap<_, _>>();
         let mut offsets_by_partition: HashMap<u32, Vec<u32>> = HashMap::new();
         for candidate in candidates {
             offsets_by_partition
@@ -942,26 +934,10 @@ impl ANNIvfSubIndexExec {
                 .or_default()
                 .push(candidate.offset_in_partition);
         }
-        let grouped_candidates = offsets_by_partition
-            .into_iter()
-            .map(|(partition_id, offsets)| {
-                let dist_q_c = q_c_dist_by_partition
-                    .get(&partition_id)
-                    .copied()
-                    .ok_or_else(|| {
-                        Error::internal(format!(
-                            "cached partition {} missing centroid distance for replay",
-                            partition_id
-                        ))
-                    })?;
-                Ok((partition_id, dist_q_c, offsets))
-            })
-            .collect::<Result<Vec<_>>>()?;
         let approx_query = Self::normalize_query_for_index(index.as_ref(), query)?;
-        let scored_batches = stream::iter(grouped_candidates)
-            .map(|(partition_id, dist_q_c, offsets)| {
-                let mut partition_query = approx_query.clone();
-                partition_query.dist_q_c = dist_q_c;
+        let scored_batches = stream::iter(offsets_by_partition)
+            .map(|(partition_id, offsets)| {
+                let partition_query = approx_query.clone();
                 let index = index.clone();
                 async move {
                     index
@@ -1042,8 +1018,6 @@ impl ANNIvfSubIndexExec {
                 index,
                 query,
                 &cache_entry.candidates,
-                &partitions,
-                &q_c_dists,
                 &metrics.index_metrics,
             )
             .await?;
@@ -1078,15 +1052,9 @@ impl ANNIvfSubIndexExec {
             .try_collect::<Vec<_>>()
             .await?;
         let candidates = Self::merge_partition_candidates(&search_results, RESULTS_CACHE_LIMIT);
-        let batch = Self::replay_cached_candidates(
-            index,
-            query,
-            &candidates,
-            &partitions,
-            &q_c_dists,
-            &metrics.index_metrics,
-        )
-        .await?;
+        let batch =
+            Self::replay_cached_candidates(index, query, &candidates, &metrics.index_metrics)
+                .await?;
         cache
             .insert_with_key(&cache_key, Arc::new(VectorResultsCacheEntry { candidates }))
             .await;
@@ -2525,7 +2493,7 @@ mod tests {
         let actual_batch = raw_index
             .score_partition_candidates(
                 partitions.value(0) as usize,
-                &partition_query,
+                &query,
                 &cached_offsets,
                 &lance_index::metrics::NoOpMetricsCollector,
             )
@@ -2592,8 +2560,6 @@ mod tests {
             raw_index,
             &query,
             &search_result.candidates,
-            &partitions,
-            &q_c_dists,
             &lance_index::metrics::NoOpMetricsCollector,
         )
         .await
