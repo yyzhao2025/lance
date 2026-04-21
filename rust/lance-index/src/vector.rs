@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use datafusion::execution::SendableRecordBatchStream;
 use deepsize::DeepSizeOf;
 use ivf::storage::IvfModel;
+use lance_core::Error;
 use lance_core::{ROW_ID_FIELD, Result};
 use lance_io::traits::Reader;
 use lance_linalg::distance::DistanceType;
@@ -118,6 +119,18 @@ pub struct Query {
     pub dist_q_c: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, DeepSizeOf)]
+pub struct PartitionSearchCandidate {
+    pub partition_id: u32,
+    pub offset_in_partition: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct PartitionSearchResult {
+    pub batch: RecordBatch,
+    pub candidates: Vec<PartitionSearchCandidate>,
+}
+
 impl From<pb::VectorMetricType> for DistanceType {
     fn from(proto: pb::VectorMetricType) -> Self {
         match proto {
@@ -197,6 +210,31 @@ pub trait VectorIndex: Send + Sync + std::fmt::Debug + Index {
         pre_filter: Arc<dyn PreFilter>,
         metrics: &dyn MetricsCollector,
     ) -> Result<RecordBatch>;
+
+    /// Search a single partition and also return stable local offsets for the
+    /// emitted candidates. This is an internal hook for experimental query
+    /// result caching and is allowed to be unsupported by an implementation.
+    async fn search_in_partition_with_candidates(
+        &self,
+        _partition_id: usize,
+        _query: &Query,
+        _pre_filter: Arc<dyn PreFilter>,
+        _metrics: &dyn MetricsCollector,
+        _candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        Err(Error::not_supported("search_in_partition_with_candidates"))
+    }
+
+    /// Resolve local offsets inside a partition back into stable row ids.
+    /// This is an internal hook for experimental query result caching.
+    async fn resolve_partition_row_ids(
+        &self,
+        _partition_id: usize,
+        _offsets_in_partition: &[u32],
+        _metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<u64>> {
+        Err(Error::not_supported("resolve_partition_row_ids"))
+    }
 
     /// If the index is loadable by IVF, so it can be a sub-index that
     /// is loaded on demand by IVF.

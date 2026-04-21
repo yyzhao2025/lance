@@ -45,8 +45,8 @@ use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::{
     INDEX_AUXILIARY_FILE_NAME, INDEX_FILE_NAME, Index, IndexType, pb,
     vector::{
-        DISTANCE_TYPE_KEY, Query, ivf::storage::IVF_METADATA_KEY, quantizer::Quantization,
-        storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
+        DISTANCE_TYPE_KEY, PartitionSearchResult, Query, ivf::storage::IVF_METADATA_KEY,
+        quantizer::Quantization, storage::IvfQuantizationStorage, v3::subindex::IvfSubIndex,
     },
 };
 use lance_index::{INDEX_METADATA_SCHEMA_KEY, IndexMetadata};
@@ -972,6 +972,76 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         local_metrics.dump_into(metrics);
 
         Ok(batch)
+    }
+
+    async fn search_in_partition_with_candidates(
+        &self,
+        partition_id: usize,
+        query: &Query,
+        pre_filter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        candidate_limit: usize,
+    ) -> Result<PartitionSearchResult> {
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        pre_filter.wait_for_ready().await?;
+
+        let query = self.preprocess_query(partition_id, query)?;
+        let (result, local_metrics) = spawn_cpu(move || {
+            let param = (&query).into();
+            let local_metrics = LocalMetricsCollector::default();
+            let part = part_entry
+                .as_any()
+                .downcast_ref::<PartitionEntry<S, Q>>()
+                .ok_or(Error::internal(
+                    "failed to downcast partition entry".to_string(),
+                ))?;
+            let flat = (&part.index as &dyn Any)
+                .downcast_ref::<FlatIndex>()
+                .ok_or_else(|| {
+                    Error::not_supported("results cache only supports IVF Flat sub-indexes")
+                })?;
+            let result = flat.search_with_candidates(
+                query.key.clone(),
+                candidate_limit,
+                param,
+                &part.storage,
+                pre_filter,
+                &local_metrics,
+                partition_id as u32,
+            )?;
+            Result::Ok((result, local_metrics))
+        })
+        .await?;
+
+        local_metrics.dump_into(metrics);
+        Ok(result)
+    }
+
+    async fn resolve_partition_row_ids(
+        &self,
+        partition_id: usize,
+        offsets_in_partition: &[u32],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<u64>> {
+        let part_entry = self.load_partition(partition_id, true, metrics).await?;
+        let part = part_entry
+            .as_any()
+            .downcast_ref::<PartitionEntry<S, Q>>()
+            .ok_or(Error::internal(
+                "failed to downcast partition entry".to_string(),
+            ))?;
+        let partition_len = part.storage.len();
+        let mut row_ids = Vec::with_capacity(offsets_in_partition.len());
+        for &offset in offsets_in_partition {
+            if offset as usize >= partition_len {
+                return Err(Error::index(format!(
+                    "partition offset {} is out of range for partition {} with {} rows",
+                    offset, partition_id, partition_len
+                )));
+            }
+            row_ids.push(part.storage.row_id(offset));
+        }
+        Ok(row_ids)
     }
 
     fn is_loadable(&self) -> bool {

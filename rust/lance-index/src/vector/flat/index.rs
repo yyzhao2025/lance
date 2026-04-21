@@ -20,8 +20,8 @@ use crate::{
     metrics::MetricsCollector,
     prefilter::PreFilter,
     vector::{
-        DIST_COL, Query,
-        graph::OrderedNode,
+        DIST_COL, PartitionSearchCandidate, PartitionSearchResult, Query,
+        graph::{OrderedFloat, OrderedNode},
         quantizer::{Quantization, QuantizationType, Quantizer, QuantizerMetadata},
         storage::{DistCalculator, VectorStore},
         v3::subindex::IvfSubIndex,
@@ -192,6 +192,128 @@ impl IvfSubIndex for FlatIndex {
 
     fn to_batch(&self) -> Result<RecordBatch> {
         Ok(RecordBatch::new_empty(Schema::empty().into()))
+    }
+}
+
+impl FlatIndex {
+    pub fn search_with_candidates(
+        &self,
+        query: ArrayRef,
+        k: usize,
+        params: FlatQueryParams,
+        storage: &impl VectorStore,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: &dyn MetricsCollector,
+        partition_id: u32,
+    ) -> Result<PartitionSearchResult> {
+        let is_range_query = params.lower_bound.is_some() || params.upper_bound.is_some();
+        let row_ids = storage.row_ids();
+        let dist_calc = storage.dist_calculator(query, params.dist_q_c);
+        let mut res = BinaryHeap::with_capacity(k);
+        metrics.record_comparisons(storage.len());
+
+        match prefilter.is_empty() {
+            true => {
+                let dists = dist_calc.distance_all(k);
+
+                if is_range_query {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+
+                    for (local_offset, (&row_id, dist)) in row_ids.zip(dists).enumerate() {
+                        let dist = dist.into();
+                        if dist < lower_bound || dist >= upper_bound {
+                            continue;
+                        }
+                        let node =
+                            OrderedNode::new((local_offset as u32, row_id), OrderedFloat(dist));
+                        if res.len() < k {
+                            res.push(node);
+                        } else if res.peek().unwrap().dist > node.dist {
+                            res.pop();
+                            res.push(node);
+                        }
+                    }
+                } else {
+                    for (local_offset, (&row_id, dist)) in row_ids.zip(dists).enumerate() {
+                        let dist = dist.into();
+                        let node =
+                            OrderedNode::new((local_offset as u32, row_id), OrderedFloat(dist));
+                        if res.len() < k {
+                            res.push(node);
+                        } else if res.peek().unwrap().dist > node.dist {
+                            res.pop();
+                            res.push(node);
+                        }
+                    }
+                }
+            }
+            false => {
+                let row_addr_mask = prefilter.mask();
+                if is_range_query {
+                    let lower_bound = params.lower_bound.unwrap_or(f32::MIN).into();
+                    let upper_bound = params.upper_bound.unwrap_or(f32::MAX).into();
+                    for (local_offset, &row_addr) in row_ids.enumerate() {
+                        if !row_addr_mask.selected(row_addr) {
+                            continue;
+                        }
+                        let dist = dist_calc.distance(local_offset as u32).into();
+                        if dist < lower_bound || dist >= upper_bound {
+                            continue;
+                        }
+
+                        let node =
+                            OrderedNode::new((local_offset as u32, row_addr), OrderedFloat(dist));
+                        if res.len() < k {
+                            res.push(node);
+                        } else if res.peek().unwrap().dist > node.dist {
+                            res.pop();
+                            res.push(node);
+                        }
+                    }
+                } else {
+                    for (local_offset, &row_addr) in row_ids.enumerate() {
+                        if !row_addr_mask.selected(row_addr) {
+                            continue;
+                        }
+
+                        let dist = dist_calc.distance(local_offset as u32).into();
+                        let node =
+                            OrderedNode::new((local_offset as u32, row_addr), OrderedFloat(dist));
+                        if res.len() < k {
+                            res.push(node);
+                        } else if res.peek().unwrap().dist > node.dist {
+                            res.pop();
+                            res.push(node);
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut candidates = Vec::with_capacity(res.len());
+        let mut result_row_ids = Vec::with_capacity(res.len());
+        let mut result_dists = Vec::with_capacity(res.len());
+        for node in res.into_iter() {
+            let (offset_in_partition, row_id) = node.id;
+            let dist = node.dist;
+            candidates.push(PartitionSearchCandidate {
+                partition_id,
+                offset_in_partition,
+            });
+            result_row_ids.push(row_id);
+            result_dists.push(dist.0);
+        }
+
+        let batch = RecordBatch::try_new(
+            ANN_SEARCH_SCHEMA.clone(),
+            vec![
+                Arc::new(Float32Array::from(result_dists)),
+                Arc::new(UInt64Array::from(result_row_ids)),
+            ],
+        )?;
+
+        Ok(PartitionSearchResult { batch, candidates })
     }
 }
 
