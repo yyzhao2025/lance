@@ -123,6 +123,7 @@ struct VectorResultsCacheEntry {
 
 #[derive(Debug, Clone)]
 struct VectorResultsCacheKey {
+    nprobes: usize,
     partition_ids: Vec<u32>,
 }
 
@@ -132,7 +133,7 @@ impl CacheKey for VectorResultsCacheKey {
     fn key(&self) -> Cow<'_, str> {
         let prefix_len = self.partition_ids.len();
         let partition_ids = self.partition_ids.iter().join(",");
-        Cow::Owned(format!("{prefix_len}:{partition_ids}"))
+        Cow::Owned(format!("{}:{prefix_len}:{partition_ids}", self.nprobes))
     }
 
     fn type_name() -> &'static str {
@@ -831,6 +832,7 @@ impl ANNIvfSubIndexExec {
     ) -> VectorResultsCacheKey {
         let prefix_len = key_length.min(nprobes).min(partitions.len());
         VectorResultsCacheKey {
+            nprobes,
             partition_ids: partitions.values()[..prefix_len].to_vec(),
         }
     }
@@ -2696,6 +2698,100 @@ mod tests {
             num_deltas
         );
         assert_eq!(metric_count(&second_stats, PARTITIONS_SEARCHED_METRIC), 0);
+    }
+
+    #[tokio::test]
+    async fn test_results_cache_separates_entries_by_nprobes() {
+        let _guard = ResultsCacheOverrideGuard::enabled(8);
+        let fixture = NprobesTestFixture::new(100, 1).await;
+        let q = fixture.get_centroid(0);
+
+        let nprobes_8_stats = StatsHolder::default();
+        fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(8)
+            .maximum_nprobes(8)
+            .scan_stats_callback(nprobes_8_stats.get_setter())
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let nprobes_8_stats = nprobes_8_stats.consume();
+        assert_eq!(
+            metric_count(&nprobes_8_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
+            0
+        );
+        assert_eq!(
+            metric_count(&nprobes_8_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
+            1
+        );
+        assert_eq!(
+            metric_count(&nprobes_8_stats, PARTITIONS_SEARCHED_METRIC),
+            8
+        );
+
+        let first_nprobes_16_stats = StatsHolder::default();
+        fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(16)
+            .maximum_nprobes(16)
+            .scan_stats_callback(first_nprobes_16_stats.get_setter())
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let first_nprobes_16_stats = first_nprobes_16_stats.consume();
+        assert_eq!(
+            metric_count(&first_nprobes_16_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
+            0
+        );
+        assert_eq!(
+            metric_count(&first_nprobes_16_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
+            1
+        );
+        assert_eq!(
+            metric_count(&first_nprobes_16_stats, PARTITIONS_SEARCHED_METRIC),
+            16
+        );
+
+        let second_nprobes_16_stats = StatsHolder::default();
+        fixture
+            .dataset
+            .scan()
+            .nearest("vector", q.as_ref(), 50)
+            .unwrap()
+            .minimum_nprobes(16)
+            .maximum_nprobes(16)
+            .scan_stats_callback(second_nprobes_16_stats.get_setter())
+            .project(&Vec::<String>::new())
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let second_nprobes_16_stats = second_nprobes_16_stats.consume();
+        assert_eq!(
+            metric_count(&second_nprobes_16_stats, VECTOR_RESULTS_CACHE_HITS_METRIC),
+            1
+        );
+        assert_eq!(
+            metric_count(&second_nprobes_16_stats, VECTOR_RESULTS_CACHE_MISSES_METRIC),
+            0
+        );
+        assert_eq!(
+            metric_count(&second_nprobes_16_stats, PARTITIONS_SEARCHED_METRIC),
+            0
+        );
     }
 
     #[tokio::test]
