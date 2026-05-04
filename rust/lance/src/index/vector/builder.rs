@@ -1419,16 +1419,39 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         let mut new_centroids: Vec<ArrayRef> =
             Vec::with_capacity(ivf.num_partitions() + split_partitions.len());
         new_centroids.extend(centroids.iter().map(|vec| vec.unwrap()));
-        let split_plans = stream::iter(split_partitions.iter().copied().enumerate())
-            .map(|(split_order, part_idx)| async move {
-                let centroid2_part_idx = ivf.num_partitions() + split_order;
-                self.build_split_plan::<T>(part_idx, centroid2_part_idx, ivf)
-                    .await
-            })
+
+        // Phase 1: Train split centroids in parallel (low memory — only samples).
+        let trained_centroids = stream::iter(split_partitions.iter().copied())
+            .map(|part_idx| async move { self.train_split_centroids::<T>(part_idx).await })
             .buffered(get_num_compute_intensive_cpus())
             .try_collect::<Vec<_>>()
             .await?;
-        let mut split_plans = split_plans.into_iter().flatten().collect::<Vec<_>>();
+
+        // Phase 2: Assign vectors sequentially (high memory — loads full raw vectors).
+        let mut split_plans = Vec::new();
+        for (split_order, (part_idx, centroids_opt)) in split_partitions
+            .iter()
+            .copied()
+            .zip(trained_centroids)
+            .enumerate()
+        {
+            let Some((centroid1, centroid2)) = centroids_opt else {
+                continue;
+            };
+            let centroid2_part_idx = ivf.num_partitions() + split_order;
+            if let Some(plan) = self
+                .assign_split_vectors::<T>(
+                    part_idx,
+                    centroid2_part_idx,
+                    &centroid1,
+                    &centroid2,
+                    ivf,
+                )
+                .await?
+            {
+                split_plans.push(plan);
+            }
+        }
         split_plans.sort_by_key(|plan| plan.part_idx);
         Self::finalize_split_plans(&mut split_plans, ivf.num_partitions());
 
@@ -1483,17 +1506,65 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         })
     }
 
-    async fn build_split_plan<T: ArrowPrimitiveType>(
+    /// Sample raw vectors from a partition for kmeans training.
+    ///
+    /// Samples row IDs first, then only loads `sample_size` vectors from disk.
+    async fn sample_partition_raw_vectors(
         &self,
         part_idx: usize,
-        centroid2_part_idx: usize,
-        ivf: &IvfModel,
-    ) -> Result<Option<SplitPlan>>
+        sample_size: usize,
+    ) -> Result<Option<FixedSizeListArray>> {
+        let Some(dataset) = self.dataset.as_ref() else {
+            return Err(Error::invalid_input(
+                "dataset not set before sample partition",
+            ));
+        };
+
+        let mut row_ids = self.partition_row_ids(part_idx).await?;
+        if !row_ids.is_sorted() {
+            row_ids.sort();
+        }
+        row_ids.dedup();
+
+        if row_ids.is_empty() {
+            return Ok(None);
+        }
+
+        // Sample row IDs with stride before loading any vectors
+        if row_ids.len() > sample_size {
+            let stride = row_ids.len() / sample_size;
+            row_ids = (0..sample_size).map(|i| row_ids[i * stride]).collect();
+        }
+
+        let batches = Self::take_vectors(dataset, &self.column, &self.store, &row_ids).await?;
+        if batches.is_empty() {
+            return Ok(None);
+        }
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+        let batch = Flatten::new(&self.column).transform(&batch)?;
+        let vectors = batch
+            .column_by_qualified_name(&self.column)
+            .ok_or(Error::invalid_input(format!(
+                "vector column {} not found in batch",
+                self.column,
+            )))?
+            .as_fixed_size_list()
+            .clone();
+        Ok(Some(vectors))
+    }
+
+    /// Train kmeans centroids for splitting a partition. This only needs a
+    /// small sample of vectors and is cheap enough to run in parallel.
+    async fn train_split_centroids<T: ArrowPrimitiveType>(
+        &self,
+        part_idx: usize,
+    ) -> Result<Option<(ArrayRef, ArrayRef)>>
     where
         T::Native: Dot + L2 + Normalize,
         PrimitiveArray<T>: From<Vec<T::Native>>,
     {
-        let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+        // Sample 256 * 2 = 512 vectors for kmeans training with k=2
+        let Some(vectors) = self.sample_partition_raw_vectors(part_idx, 512).await? else {
             return Ok(None);
         };
 
@@ -1514,11 +1585,33 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             256,
         )?;
 
+        let centroid1 = kmeans.centroids.slice(0, dimension);
+        let centroid2 = kmeans.centroids.slice(dimension, dimension);
+        Ok(Some((centroid1, centroid2)))
+    }
+
+    /// Assign all vectors in a partition to split centroids. This loads the
+    /// full raw vectors and is memory-intensive — should run with limited
+    /// concurrency.
+    async fn assign_split_vectors<T: ArrowPrimitiveType>(
+        &self,
+        part_idx: usize,
+        centroid2_part_idx: usize,
+        centroid1: &ArrayRef,
+        centroid2: &ArrayRef,
+        ivf: &IvfModel,
+    ) -> Result<Option<SplitPlan>>
+    where
+        T::Native: Dot + L2 + Normalize,
+        PrimitiveArray<T>: From<Vec<T::Native>>,
+    {
+        let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+            return Ok(None);
+        };
+
         let c0 = ivf
             .centroid(part_idx)
             .ok_or(Error::invalid_input("original centroid not found"))?;
-        let centroid1 = kmeans.centroids.slice(0, dimension);
-        let centroid2 = kmeans.centroids.slice(dimension, dimension);
         let (reassign_part_ids, reassign_part_centroids) =
             self.select_reassign_candidates(ivf, part_idx, &c0)?;
 
@@ -1545,8 +1638,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         Ok(Some(SplitPlan {
             part_idx,
             centroid2_part_idx,
-            centroid1,
-            centroid2,
+            centroid1: centroid1.clone(),
+            centroid2: centroid2.clone(),
             reassign_part_ids,
             original_assign_ops,
         }))
@@ -1581,48 +1674,42 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         }
 
-        let candidate_moves = stream::iter(candidate_partitions.into_iter())
-            .map(|(part_idx, requests)| async move {
-                let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await?
-                else {
-                    return Ok::<Vec<CandidateMove>, Error>(Vec::new());
-                };
+        // Process candidate partitions sequentially to avoid loading raw vectors
+        // for many partitions simultaneously.
+        let mut candidate_moves = Vec::new();
+        for (part_idx, requests) in candidate_partitions {
+            let Some((row_ids, vectors)) = self.load_partition_raw_vectors(part_idx).await? else {
+                continue;
+            };
 
-                let candidate_centroid = ivf.centroid(part_idx).ok_or(Error::invalid_input(
-                    format!("candidate centroid not found for partition {part_idx}"),
-                ))?;
-                let baseline_dists =
-                    self.distance_type.arrow_batch_func()(candidate_centroid.as_ref(), &vectors)?;
-                let mut best_moves = vec![None; row_ids.len()];
-                for request in requests {
-                    let d1 = self.distance_type.arrow_batch_func()(
-                        request.centroid1.as_ref(),
-                        &vectors,
-                    )?;
-                    let d2 = self.distance_type.arrow_batch_func()(
-                        request.centroid2.as_ref(),
-                        &vectors,
-                    )?;
-                    Self::update_best_candidate_moves::<T>(
-                        request.centroid1_part_idx,
-                        request.centroid2_part_idx,
-                        &row_ids,
-                        &vectors,
-                        baseline_dists.values(),
-                        d1.values(),
-                        d2.values(),
-                        &mut best_moves,
-                        part_idx,
-                    );
-                }
+            let candidate_centroid = ivf.centroid(part_idx).ok_or(Error::invalid_input(
+                format!("candidate centroid not found for partition {part_idx}"),
+            ))?;
+            let baseline_dists =
+                self.distance_type.arrow_batch_func()(candidate_centroid.as_ref(), &vectors)?;
+            let mut best_moves = vec![None; row_ids.len()];
+            for request in requests {
+                let d1 =
+                    self.distance_type.arrow_batch_func()(request.centroid1.as_ref(), &vectors)?;
+                let d2 =
+                    self.distance_type.arrow_batch_func()(request.centroid2.as_ref(), &vectors)?;
+                Self::update_best_candidate_moves::<T>(
+                    request.centroid1_part_idx,
+                    request.centroid2_part_idx,
+                    &row_ids,
+                    &vectors,
+                    baseline_dists.values(),
+                    d1.values(),
+                    d2.values(),
+                    &mut best_moves,
+                    part_idx,
+                );
+            }
 
-                Ok(best_moves.into_iter().flatten().collect::<Vec<_>>())
-            })
-            .buffered(get_num_compute_intensive_cpus())
-            .try_collect::<Vec<_>>()
-            .await?;
+            candidate_moves.extend(best_moves.into_iter().flatten());
+        }
 
-        Ok(candidate_moves.into_iter().flatten().collect())
+        Ok(candidate_moves)
     }
 
     fn finalize_split_plans(split_plans: &mut [SplitPlan], base_num_partitions: usize) {
