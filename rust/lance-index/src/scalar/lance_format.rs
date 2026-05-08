@@ -214,7 +214,8 @@ impl IndexReader for current_reader::FileReader {
                 u32::MAX,
                 projection,
                 FilterExpression::no_filter(),
-            )?
+            )
+            .await?
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(batches.len(), 1);
