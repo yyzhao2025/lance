@@ -254,6 +254,7 @@ pub struct SerializedRepDefs {
     ///
     /// This is None if there are no lists
     pub max_visible_level: Option<u16>,
+    pub(crate) has_fsl: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,11 +266,43 @@ pub(crate) struct RepDefRowSlice {
     pub(crate) num_values: u64,
 }
 
+impl RepDefRowSlice {
+    pub(crate) fn num_levels(&self) -> u64 {
+        (self.level_range.end - self.level_range.start) as u64
+    }
+
+    pub(crate) fn has_structural_overhead(&self) -> bool {
+        self.num_levels() > self.num_values
+    }
+
+    pub(crate) fn merge_contiguous(row_slices: &[Self]) -> Self {
+        debug_assert!(!row_slices.is_empty());
+        let first = row_slices.first().unwrap();
+        let last = row_slices.last().unwrap();
+        Self {
+            row_start: first.row_start,
+            num_rows: row_slices.len() as u64,
+            level_range: first.level_range.start..last.level_range.end,
+            value_start: first.value_start,
+            num_values: row_slices.iter().map(|row| row.num_values).sum(),
+        }
+    }
+}
+
 impl SerializedRepDefs {
     pub fn new(
         repetition_levels: Option<LevelBuffer>,
         definition_levels: Option<LevelBuffer>,
         def_meaning: Vec<DefinitionInterpretation>,
+    ) -> Self {
+        Self::new_with_has_fsl(repetition_levels, definition_levels, def_meaning, false)
+    }
+
+    pub(crate) fn new_with_has_fsl(
+        repetition_levels: Option<LevelBuffer>,
+        definition_levels: Option<LevelBuffer>,
+        def_meaning: Vec<DefinitionInterpretation>,
+        has_fsl: bool,
     ) -> Self {
         let first_list = def_meaning.iter().position(|level| level.is_list());
         let max_visible_level = first_list.map(|first_list| {
@@ -284,6 +317,7 @@ impl SerializedRepDefs {
             definition_levels: definition_levels.map(Arc::from),
             def_meaning,
             max_visible_level,
+            has_fsl,
         }
     }
 
@@ -294,6 +328,7 @@ impl SerializedRepDefs {
             definition_levels: None,
             def_meaning,
             max_visible_level: None,
+            has_fsl: false,
         }
     }
 
@@ -394,99 +429,6 @@ impl SerializedRepDefs {
         }
 
         Ok(Some(slices))
-    }
-
-    pub(crate) fn has_top_level_zero_value_run_over(
-        &self,
-        max_levels: u64,
-        num_rows: u64,
-        num_values: u64,
-    ) -> Result<bool> {
-        let Some(max_visible_level) = self.max_visible_level else {
-            return Ok(false);
-        };
-        let Some(rep) = self.repetition_levels.as_ref() else {
-            return Ok(false);
-        };
-        let Some(def) = self.definition_levels.as_ref() else {
-            return Ok(false);
-        };
-
-        if rep.len() != def.len() {
-            return Err(Error::internal(format!(
-                "Cannot inspect structural runs with mismatched rep/def levels: rep={}, def={}",
-                rep.len(),
-                def.len()
-            )));
-        }
-
-        let max_rep = self
-            .def_meaning
-            .iter()
-            .filter(|level| level.is_list())
-            .count() as u16;
-        if max_rep == 0 {
-            return Ok(false);
-        }
-
-        let expected_rows = usize::try_from(num_rows).map_err(|_| {
-            Error::internal(format!(
-                "Cannot inspect structural runs for {} rows on this platform",
-                num_rows
-            ))
-        })?;
-
-        let mut row_start = None;
-        let mut rows_seen = 0usize;
-        let mut total_visible_values = 0u64;
-        let mut zero_value_run_levels = 0u64;
-
-        let mut inspect_row = |level_range: Range<usize>| {
-            let num_row_values = def[level_range.clone()]
-                .iter()
-                .filter(|def_level| **def_level <= max_visible_level)
-                .count() as u64;
-            total_visible_values += num_row_values;
-            if num_row_values == 0 {
-                zero_value_run_levels += (level_range.end - level_range.start) as u64;
-                zero_value_run_levels > max_levels
-            } else {
-                zero_value_run_levels = 0;
-                false
-            }
-        };
-
-        for (idx, rep_level) in rep.iter().enumerate() {
-            if *rep_level == max_rep {
-                if let Some(start) = row_start
-                    && inspect_row(start..idx)
-                {
-                    return Ok(true);
-                }
-                row_start = Some(idx);
-                rows_seen += 1;
-            }
-        }
-        if let Some(start) = row_start
-            && inspect_row(start..rep.len())
-        {
-            return Ok(true);
-        }
-
-        if rows_seen != expected_rows {
-            return Err(Error::internal(format!(
-                "Cannot inspect structural runs: expected {} top-level row starts, found {}",
-                expected_rows, rows_seen
-            )));
-        }
-        if total_visible_values != num_values {
-            return Err(Error::internal(format!(
-                "Cannot inspect structural runs: counted {} visible values, expected {}",
-                total_visible_values, num_values
-            )));
-        }
-
-        Ok(false)
     }
 }
 
@@ -651,6 +593,7 @@ struct SerializerContext {
     current_def: u16,
     current_len: usize,
     current_num_specials: usize,
+    has_fsl: bool,
 }
 
 impl SerializerContext {
@@ -682,6 +625,7 @@ impl SerializerContext {
             current_def: max_def,
             current_len: 0,
             current_num_specials: 0,
+            has_fsl: false,
         }
     }
 
@@ -923,6 +867,7 @@ impl SerializerContext {
     }
 
     fn record_fsl(&mut self, fsl_desc: &FslDesc) {
+        self.has_fsl = true;
         self.record_validity_buf(&fsl_desc.validity);
         self.multiply_levels(fsl_desc.dimension);
     }
@@ -937,7 +882,7 @@ impl SerializerContext {
 
     fn build(mut self) -> SerializedRepDefs {
         if self.current_len == 0 {
-            return SerializedRepDefs::new(None, None, self.def_meaning);
+            return SerializedRepDefs::new_with_has_fsl(None, None, self.def_meaning, self.has_fsl);
         }
 
         self.normalize_specials();
@@ -956,7 +901,12 @@ impl SerializerContext {
         // Need to reverse the def meaning since we build rep / def levels in reverse
         let def_meaning = self.def_meaning.into_iter().rev().collect::<Vec<_>>();
 
-        SerializedRepDefs::new(repetition_levels, definition_levels, def_meaning)
+        SerializedRepDefs::new_with_has_fsl(
+            repetition_levels,
+            definition_levels,
+            def_meaning,
+            self.has_fsl,
+        )
     }
 }
 

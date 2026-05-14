@@ -262,7 +262,9 @@ mod tests {
         DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
     }
 
-    async fn encode_v22_pages(array: ArrayRef) -> Vec<crate::encoder::EncodedPage> {
+    async fn try_encode_v22_pages(
+        array: ArrayRef,
+    ) -> lance_core::Result<Vec<crate::encoder::EncodedPage>> {
         let arrow_field = Field::new("", array.data_type().clone(), true);
         let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
         let encoding_strategy = crate::encoder::default_encoding_strategy(LanceFileVersion::V2_2);
@@ -293,12 +295,16 @@ mod tests {
             )
             .unwrap()
         {
-            pages.push(task.await.unwrap());
+            pages.push(task.await?);
         }
         for task in encoder.flush(&mut external_buffers).unwrap() {
-            pages.push(task.await.unwrap());
+            pages.push(task.await?);
         }
-        pages
+        Ok(pages)
+    }
+
+    async fn encode_v22_pages(array: ArrayRef) -> Vec<crate::encoder::EncodedPage> {
+        try_encode_v22_pages(array).await.unwrap()
     }
 
     fn assert_sparse_boolean_layout(
@@ -320,8 +326,12 @@ mod tests {
                 crate::format::pb21::page_layout::Layout::FullZipLayout(_) => {
                     fullzip_pages += 1;
                 }
-                crate::format::pb21::page_layout::Layout::ConstantLayout(_) => {
-                    structural_only_pages += 1;
+                crate::format::pb21::page_layout::Layout::ConstantLayout(layout) => {
+                    if layout.inline_value.is_none()
+                        && (layout.num_rep_values > 0 || layout.num_def_values > 0)
+                    {
+                        structural_only_pages += 1;
+                    }
                 }
                 crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
             }
@@ -1141,5 +1151,71 @@ mod tests {
         let pages = encode_v22_pages(list_array.clone()).await;
         assert_sparse_boolean_layout(&pages, true);
         check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_with_amortized_long_empty_prefix() {
+        let empty_prefix_rows = 62_000usize;
+        let booleans_per_list = 8_192usize;
+        let num_rows = empty_prefix_rows + 1;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.extend(std::iter::repeat_n(0i32, empty_prefix_rows + 1));
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        offsets.push(values.len() as i32);
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            None,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, empty_prefix_rows as u64])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_sparse_boolean_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_sparse_boolean_list_fails_without_panic() {
+        let empty_inner_lists = 70_000usize;
+        let booleans_per_list = 8usize;
+
+        let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        inner_offsets.push(values.len() as i32);
+
+        let inner_items = BooleanArray::from(values);
+        let inner_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
+            Arc::new(inner_items),
+            None,
+        );
+        let outer_list = ListArray::new(
+            Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 1])),
+            Arc::new(inner_list),
+            None,
+        );
+
+        let err = try_encode_v22_pages(Arc::new(outer_list))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Mini-block cannot encode")
+                || err.to_string().contains("byte aligned"),
+            "unexpected error: {err}"
+        );
     }
 }

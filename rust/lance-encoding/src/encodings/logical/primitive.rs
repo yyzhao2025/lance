@@ -2459,7 +2459,15 @@ impl FullZipScheduler {
 
         // Convert item ranges to byte ranges (i.e. multiply by bytes per item)
         let bits_per_value = decompressor.bits_per_value();
-        assert_eq!(bits_per_value % 8, 0);
+        if !bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Full-zip fixed-width values must be byte aligned, got {} bits per value",
+                    bits_per_value
+                )
+                .into(),
+            ));
+        }
         let bytes_per_value = bits_per_value / 8;
         let bytes_per_cw = self.details.ctrl_word_parser.bytes_per_word();
         let total_bytes_per_value = bytes_per_value + bytes_per_cw as u64;
@@ -3835,15 +3843,6 @@ impl PrimitiveStructuralEncoder {
         Self::is_narrow(data_block)
     }
 
-    fn repdef_level_count(repdef: &SerializedRepDefs) -> u64 {
-        repdef
-            .repetition_levels
-            .as_ref()
-            .map(|r| r.len() as u64)
-            .max(repdef.definition_levels.as_ref().map(|d| d.len() as u64))
-            .unwrap_or(0)
-    }
-
     fn repdef_bits_per_level(repdef: &SerializedRepDefs) -> Option<u64> {
         let bits_per_rep = repdef
             .repetition_levels
@@ -3870,35 +3869,6 @@ impl PrimitiveStructuralEncoder {
 
         // The serialized level chunk header stores the level count in u16.
         Some(budgeted_levels.min(u16::MAX as u64))
-    }
-
-    /// Checks if the rep/def levels are too sparse for miniblock encoding.
-    ///
-    /// Miniblock value chunks have at most MAX_MINIBLOCK_VALUES (4096) data
-    /// values, but sparse list structure can add many rep/def levels with no
-    /// corresponding value.  This estimates whether an average value chunk would
-    /// exceed the rep/def level budget.
-    fn repdef_too_sparse_for_miniblock(repdef: &SerializedRepDefs, num_values: u64) -> bool {
-        if num_values == 0 {
-            return false;
-        }
-        let num_levels = Self::repdef_level_count(repdef);
-        if num_levels == 0 {
-            return false;
-        }
-        let Some(max_levels_per_chunk) = Self::max_repdef_levels_per_miniblock(repdef) else {
-            return false;
-        };
-        if num_levels <= max_levels_per_chunk {
-            return false;
-        }
-
-        // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
-        // ratio tells us how many levels a chunk of that size would need.
-        let levels_per_chunk =
-            (num_levels as f64 / num_values as f64) * *miniblock::MAX_MINIBLOCK_VALUES as f64;
-
-        levels_per_chunk > max_levels_per_chunk as f64
     }
 
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
@@ -5197,10 +5167,11 @@ impl PrimitiveStructuralEncoder {
             .definition_levels
             .as_ref()
             .map(|levels| levels[range].to_vec());
-        SerializedRepDefs::new(
+        SerializedRepDefs::new_with_has_fsl(
             repetition_levels,
             definition_levels,
             repdef.def_meaning.clone(),
+            repdef.has_fsl,
         )
     }
 
@@ -5248,64 +5219,63 @@ impl PrimitiveStructuralEncoder {
         Ok(sliced)
     }
 
-    fn row_slice_num_levels(row: &RepDefRowSlice) -> u64 {
-        (row.level_range.end - row.level_range.start) as u64
-    }
-
-    fn merge_row_slices(row_slices: &[RepDefRowSlice]) -> RepDefRowSlice {
-        debug_assert!(!row_slices.is_empty());
-        let first = row_slices.first().unwrap();
-        let last = row_slices.last().unwrap();
-        RepDefRowSlice {
-            row_start: first.row_start,
-            num_rows: row_slices.len() as u64,
-            level_range: first.level_range.start..last.level_range.end,
-            value_start: first.value_start,
-            num_values: row_slices.iter().map(|row| row.num_values).sum(),
-        }
-    }
-
     fn plan_structural_page_splits(
         repdef: &SerializedRepDefs,
         num_rows: u64,
         num_values: u64,
     ) -> Result<Option<Vec<RepDefRowSlice>>> {
+        if num_values == 0 {
+            return Ok(None);
+        }
+        if repdef.has_fsl {
+            return Ok(None);
+        }
         let Some(max_levels) = Self::max_repdef_levels_per_miniblock(repdef) else {
             return Ok(None);
         };
-        let too_sparse = Self::repdef_too_sparse_for_miniblock(repdef, num_values);
-        let has_long_zero_value_run = !too_sparse
-            && Self::repdef_level_count(repdef) > max_levels
-            && repdef.has_top_level_zero_value_run_over(max_levels, num_rows, num_values)?;
-        if !too_sparse && !has_long_zero_value_run {
-            return Ok(None);
-        }
-
         let Some(row_slices) = repdef.top_level_row_slices(num_rows, num_values)? else {
             return Ok(None);
         };
         if row_slices.len() <= 1 {
             return Ok(None);
         }
+        if !row_slices
+            .iter()
+            .any(RepDefRowSlice::has_structural_overhead)
+        {
+            return Ok(None);
+        }
 
         let mut splits = Vec::new();
         let mut current_start = 0usize;
         let mut current_levels = 0u64;
+        let mut current_has_structural_overhead = false;
         for (row_idx, row) in row_slices.iter().enumerate() {
-            let row_levels = Self::row_slice_num_levels(row);
-            if row_idx > current_start && current_levels + row_levels > max_levels {
-                splits.push(Self::merge_row_slices(&row_slices[current_start..row_idx]));
+            let row_levels = row.num_levels();
+            let next_has_structural_overhead =
+                current_has_structural_overhead || row.has_structural_overhead();
+            if row_idx > current_start
+                && next_has_structural_overhead
+                && current_levels + row_levels > max_levels
+            {
+                splits.push(RepDefRowSlice::merge_contiguous(
+                    &row_slices[current_start..row_idx],
+                ));
                 current_start = row_idx;
                 current_levels = 0;
+                current_has_structural_overhead = false;
             }
             current_levels += row_levels;
+            current_has_structural_overhead |= row.has_structural_overhead();
         }
-        splits.push(Self::merge_row_slices(&row_slices[current_start..]));
+        splits.push(RepDefRowSlice::merge_contiguous(
+            &row_slices[current_start..],
+        ));
 
         Ok((splits.len() > 1).then_some(splits))
     }
 
-    fn split_sparse_structural_pages(
+    fn split_structural_pages_for_miniblock_budget(
         arrays: Vec<ArrayRef>,
         repdef: SerializedRepDefs,
         row_number: u64,
@@ -5457,50 +5427,34 @@ impl PrimitiveStructuralEncoder {
             );
         }
 
-        // If the rep/def levels are too sparse for miniblock (e.g. many empty
-        // lists with very few values), fall back to fullzip to avoid exceeding
-        // the u16 per-chunk rep/def buffer size limit.
-        let too_sparse = Self::repdef_too_sparse_for_miniblock(&repdef, num_values);
-
-        if !too_sparse {
-            if let DataBlock::Dictionary(dict) = data_block {
-                log::debug!(
-                    "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
-                    column_idx,
-                    num_values
-                );
-                let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
-                // TODO: https://github.com/lancedb/lance/issues/4809
-                // If we compute stats on dictionary_data_block => panic.
-                // If we don't compute stats on indices_data_block => panic.
-                // This is messy.  Don't make me call compute_stat ever.
-                indices_data_block.compute_stat();
-                return Self::encode_miniblock(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    indices_data_block,
-                    repdef,
-                    row_number,
-                    Some(dictionary_data_block),
-                    num_rows,
-                    support_large_chunk,
-                );
-            }
-        } else {
+        if let DataBlock::Dictionary(dict) = data_block {
             log::debug!(
-                "Encoding column {} with {} items using full-zip layout \
-                 (rep/def too sparse for mini-block)",
+                "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
                 column_idx,
                 num_values
+            );
+            let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
+            // TODO: https://github.com/lancedb/lance/issues/4809
+            // If we compute stats on dictionary_data_block => panic.
+            // If we don't compute stats on indices_data_block => panic.
+            // This is messy.  Don't make me call compute_stat ever.
+            indices_data_block.compute_stat();
+            return Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                indices_data_block,
+                repdef,
+                row_number,
+                Some(dictionary_data_block),
+                num_rows,
+                support_large_chunk,
             );
         }
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
         // preferred structural encoding.
-        let dict_result = if too_sparse {
-            None
-        } else {
+        let dict_result =
             Self::should_dictionary_encode(&data_block, &field, version).and_then(|budget| {
                 log::debug!(
                     "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
@@ -5512,8 +5466,7 @@ impl PrimitiveStructuralEncoder {
                     budget.max_dict_entries,
                     budget.max_encoded_size,
                 )
-            })
-        };
+            });
 
         if let Some((indices_data_block, dictionary_data_block)) = dict_result {
             Self::encode_miniblock(
@@ -5527,7 +5480,7 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 support_large_chunk,
             )
-        } else if !too_sparse && Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+        } else if Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
             log::debug!(
                 "Encoding column {} with {} items using mini-block layout",
                 column_idx,
@@ -5544,7 +5497,7 @@ impl PrimitiveStructuralEncoder {
                 num_rows,
                 support_large_chunk,
             )
-        } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
+        } else if Self::prefers_fullzip(encoding_metadata.as_ref()) {
             log::debug!(
                 "Encoding column {} with {} items using full-zip layout",
                 column_idx,
@@ -5576,8 +5529,9 @@ impl PrimitiveStructuralEncoder {
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
         let repdef = RepDefBuilder::serialize(repdefs);
-        let pages =
-            Self::split_sparse_structural_pages(arrays, repdef, row_number, num_rows, num_values)?;
+        let pages = Self::split_structural_pages_for_miniblock_budget(
+            arrays, repdef, row_number, num_rows, num_values,
+        )?;
 
         let mut tasks = Vec::with_capacity(pages.len());
         let ctx = PrimitiveEncodeContext {
