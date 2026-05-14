@@ -946,4 +946,78 @@ mod tests {
         check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, field_metadata)
             .await;
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_uses_miniblock() {
+        // Redacted reproduction from a production schema shape containing ARRAY(BOOLEAN).
+        // The field names are not relevant; the failure requires sparse list structure
+        // with a 1-bit Boolean leaf value.
+        let num_rows = 200_000usize;
+        let num_non_empty = 10usize;
+        let booleans_per_list = 8usize;
+        let step = num_rows / num_non_empty;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        let mut values = Vec::with_capacity(num_non_empty * booleans_per_list);
+        offsets.push(0i32);
+
+        let mut next_non_empty = step / 2;
+        for row in 0..num_rows {
+            if row == next_non_empty {
+                values.extend((0..booleans_per_list).map(|idx| idx % 2 == 0));
+                next_non_empty += step;
+            }
+            offsets.push(values.len() as i32);
+        }
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            None,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..1000)
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_with_long_empty_prefix() {
+        let empty_prefix_rows = 70_000usize;
+        let trailing_empty_rows = 9usize;
+        let booleans_per_list = 8usize;
+        let num_rows = empty_prefix_rows + 1 + trailing_empty_rows;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.extend(std::iter::repeat_n(0i32, empty_prefix_rows + 1));
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        offsets.push(values.len() as i32);
+        offsets.extend(std::iter::repeat_n(
+            values.len() as i32,
+            trailing_empty_rows,
+        ));
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            None,
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, empty_prefix_rows as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
+            .await;
+    }
 }

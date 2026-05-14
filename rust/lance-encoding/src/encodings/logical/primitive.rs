@@ -59,7 +59,7 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, build_control_word_iterator,
+        RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -3757,6 +3757,22 @@ struct DictEncodingBudget {
     max_encoded_size: usize,
 }
 
+struct PrimitivePageData {
+    arrays: Vec<ArrayRef>,
+    repdef: SerializedRepDefs,
+    row_number: u64,
+    num_rows: u64,
+}
+
+#[derive(Debug)]
+struct PrimitivePageSplit {
+    row_start: u64,
+    num_rows: u64,
+    level_range: Range<usize>,
+    value_start: u64,
+    num_values: u64,
+}
+
 impl PrimitiveStructuralEncoder {
     pub fn try_new(
         options: &EncodingOptions,
@@ -5138,7 +5154,415 @@ impl PrimitiveStructuralEncoder {
         }
     }
 
-    // Creates an encode task, consuming all buffered data
+    fn slice_repdef(repdef: &SerializedRepDefs, range: Range<usize>) -> SerializedRepDefs {
+        let repetition_levels = repdef
+            .repetition_levels
+            .as_ref()
+            .map(|levels| levels[range.clone()].to_vec());
+        let definition_levels = repdef
+            .definition_levels
+            .as_ref()
+            .map(|levels| levels[range].to_vec());
+        SerializedRepDefs::new(
+            repetition_levels,
+            definition_levels,
+            repdef.def_meaning.clone(),
+        )
+    }
+
+    fn slice_arrays(
+        arrays: &[ArrayRef],
+        value_start: u64,
+        num_values: u64,
+    ) -> Result<Vec<ArrayRef>> {
+        if num_values == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut values_to_skip = usize::try_from(value_start).map_err(|_| {
+            Error::invalid_input(format!("Value start {} is too large", value_start))
+        })?;
+        let mut values_remaining = usize::try_from(num_values).map_err(|_| {
+            Error::invalid_input(format!("Value count {} is too large", num_values))
+        })?;
+        let mut sliced = Vec::new();
+
+        for array in arrays {
+            if values_to_skip >= array.len() {
+                values_to_skip -= array.len();
+                continue;
+            }
+
+            let offset = values_to_skip;
+            let len = (array.len() - offset).min(values_remaining);
+            sliced.push(array.slice(offset, len));
+            values_remaining -= len;
+            values_to_skip = 0;
+
+            if values_remaining == 0 {
+                break;
+            }
+        }
+
+        if values_remaining != 0 {
+            return Err(Error::internal(format!(
+                "Page split requested {} values starting at {}, but the page did not contain enough values",
+                num_values, value_start
+            )));
+        }
+
+        Ok(sliced)
+    }
+
+    fn plan_structural_page_splits(
+        repdef: &SerializedRepDefs,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Option<Vec<PrimitivePageSplit>> {
+        let max_visible_level = repdef.max_visible_level?;
+        let rep = repdef.repetition_levels.as_ref()?;
+        let def = repdef.definition_levels.as_ref()?;
+        let max_rep = repdef
+            .def_meaning
+            .iter()
+            .filter(|level| level.is_list())
+            .count() as u16;
+        if max_rep == 0 {
+            return None;
+        }
+
+        let num_rows = usize::try_from(num_rows).ok()?;
+        let mut row_starts = Vec::with_capacity(num_rows + 1);
+        for (idx, rep_level) in rep.iter().enumerate() {
+            if *rep_level == max_rep {
+                row_starts.push(idx);
+            }
+        }
+        if row_starts.len() != num_rows {
+            return None;
+        }
+        row_starts.push(rep.len());
+
+        let mut row_values = Vec::with_capacity(num_rows);
+        let mut total_visible_values = 0u64;
+        for row_idx in 0..num_rows {
+            let level_range = row_starts[row_idx]..row_starts[row_idx + 1];
+            let visible_values = def[level_range]
+                .iter()
+                .filter(|def_level| **def_level <= max_visible_level)
+                .count() as u64;
+            row_values.push(visible_values);
+            total_visible_values += visible_values;
+        }
+        if total_visible_values != num_values {
+            return None;
+        }
+
+        let mut splits = Vec::new();
+        let mut run_start_row = 0usize;
+        let mut run_value_start = 0u64;
+        let mut run_values = 0u64;
+        let mut run_is_empty = row_values.first().copied()? == 0;
+
+        for (row_idx, row_visible_values) in row_values.iter().copied().enumerate() {
+            let row_is_empty = row_visible_values == 0;
+            if row_idx > run_start_row && row_is_empty != run_is_empty {
+                splits.push(PrimitivePageSplit {
+                    row_start: run_start_row as u64,
+                    num_rows: (row_idx - run_start_row) as u64,
+                    level_range: row_starts[run_start_row]..row_starts[row_idx],
+                    value_start: run_value_start,
+                    num_values: run_values,
+                });
+                run_start_row = row_idx;
+                run_value_start += run_values;
+                run_values = 0;
+                run_is_empty = row_is_empty;
+            }
+            run_values += row_visible_values;
+        }
+
+        splits.push(PrimitivePageSplit {
+            row_start: run_start_row as u64,
+            num_rows: (num_rows - run_start_row) as u64,
+            level_range: row_starts[run_start_row]..*row_starts.last().unwrap(),
+            value_start: run_value_start,
+            num_values: run_values,
+        });
+
+        (splits.len() > 1).then_some(splits)
+    }
+
+    fn split_sparse_structural_pages(
+        arrays: Vec<ArrayRef>,
+        repdef: SerializedRepDefs,
+        row_number: u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<Vec<PrimitivePageData>> {
+        if !Self::repdef_too_sparse_for_miniblock(&repdef, num_values) {
+            return Ok(vec![PrimitivePageData {
+                arrays,
+                repdef,
+                row_number,
+                num_rows,
+            }]);
+        }
+
+        let Some(splits) = Self::plan_structural_page_splits(&repdef, num_rows, num_values) else {
+            return Ok(vec![PrimitivePageData {
+                arrays,
+                repdef,
+                row_number,
+                num_rows,
+            }]);
+        };
+
+        let mut pages = Vec::with_capacity(splits.len());
+        for split in splits {
+            let arrays = Self::slice_arrays(&arrays, split.value_start, split.num_values)?;
+            let repdef = Self::slice_repdef(&repdef, split.level_range);
+            pages.push(PrimitivePageData {
+                arrays,
+                repdef,
+                row_number: row_number + split.row_start,
+                num_rows: split.num_rows,
+            });
+        }
+        Ok(pages)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_page(
+        column_idx: u32,
+        field: Field,
+        compression_strategy: Arc<dyn CompressionStrategy>,
+        encoding_metadata: Arc<HashMap<String, String>>,
+        support_large_chunk: bool,
+        version: LanceFileVersion,
+        is_simple_validity: bool,
+        has_repdef_info: bool,
+        page: PrimitivePageData,
+    ) -> Result<EncodedPage> {
+        let PrimitivePageData {
+            arrays,
+            repdef,
+            row_number,
+            num_rows,
+        } = page;
+        let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+
+        if num_values == 0 {
+            // This page contains only structural events, such as empty/null list rows.
+            // The existing complex-null layout stores the rep/def stream without value buffers.
+            log::debug!(
+                "Encoding column {} with {} items ({} rows) using complex-null layout",
+                column_idx,
+                num_values,
+                num_rows
+            );
+            return Self::encode_complex_all_null(
+                column_idx,
+                repdef,
+                row_number,
+                num_rows,
+                version,
+                compression_strategy.as_ref(),
+            );
+        }
+
+        let leaf_validity = Self::leaf_validity(&repdef, num_values as usize)?;
+        let all_null = leaf_validity
+            .as_ref()
+            .map(|validity| validity.count_set_bits() == 0)
+            .unwrap_or(false);
+
+        if all_null {
+            return if is_simple_validity {
+                log::debug!(
+                    "Encoding column {} with {} items ({} rows) using simple-null layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                Self::encode_simple_all_null(column_idx, num_values, row_number)
+            } else {
+                log::debug!(
+                    "Encoding column {} with {} items ({} rows) using complex-null layout",
+                    column_idx,
+                    num_values,
+                    num_rows
+                );
+                Self::encode_complex_all_null(
+                    column_idx,
+                    repdef,
+                    row_number,
+                    num_rows,
+                    version,
+                    compression_strategy.as_ref(),
+                )
+            };
+        }
+
+        if let DataType::Struct(fields) = &field.data_type()
+            && fields.is_empty()
+        {
+            if has_repdef_info {
+                return Err(Error::invalid_input_source(format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into()));
+            }
+            // This is maybe a little confusing but the reader should never look at this anyways and it
+            // seems like overkill to invent a new layout just for "empty structs".
+            return Self::encode_simple_all_null(column_idx, num_values, row_number);
+        }
+
+        let data_block = DataBlock::from_arrays(&arrays, num_values);
+
+        if version.resolve() >= LanceFileVersion::V2_2
+            && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
+        {
+            log::debug!(
+                "Encoding column {} with {} items ({} rows) using constant layout",
+                column_idx,
+                num_values,
+                num_rows
+            );
+            return constant::encode_constant_page(
+                column_idx, scalar, repdef, row_number, num_rows,
+            );
+        }
+
+        let requires_full_zip_packed_struct =
+            if let DataBlock::Struct(ref struct_data_block) = data_block {
+                struct_data_block.has_variable_width_child()
+            } else {
+                false
+            };
+
+        if requires_full_zip_packed_struct {
+            log::debug!(
+                "Encoding column {} with {} items using full-zip packed struct layout",
+                column_idx,
+                num_values
+            );
+            return Self::encode_full_zip(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                repdef,
+                row_number,
+                num_rows,
+            );
+        }
+
+        // If the rep/def levels are too sparse for miniblock (e.g. many empty
+        // lists with very few values), fall back to fullzip to avoid exceeding
+        // the u16 per-chunk rep/def buffer size limit.
+        let too_sparse = Self::repdef_too_sparse_for_miniblock(&repdef, num_values);
+
+        if !too_sparse {
+            if let DataBlock::Dictionary(dict) = data_block {
+                log::debug!(
+                    "Encoding column {} with {} items using dictionary encoding (already dictionary encoded)",
+                    column_idx,
+                    num_values
+                );
+                let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
+                // TODO: https://github.com/lancedb/lance/issues/4809
+                // If we compute stats on dictionary_data_block => panic.
+                // If we don't compute stats on indices_data_block => panic.
+                // This is messy.  Don't make me call compute_stat ever.
+                indices_data_block.compute_stat();
+                return Self::encode_miniblock(
+                    column_idx,
+                    &field,
+                    compression_strategy.as_ref(),
+                    indices_data_block,
+                    repdef,
+                    row_number,
+                    Some(dictionary_data_block),
+                    num_rows,
+                    support_large_chunk,
+                );
+            }
+        } else {
+            log::debug!(
+                "Encoding column {} with {} items using full-zip layout \
+                 (rep/def too sparse for mini-block)",
+                column_idx,
+                num_values
+            );
+        }
+
+        // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
+        // preferred structural encoding.
+        let dict_result = if too_sparse {
+            None
+        } else {
+            Self::should_dictionary_encode(&data_block, &field, version).and_then(|budget| {
+                log::debug!(
+                    "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
+                    column_idx,
+                    num_values
+                );
+                dict::dictionary_encode(
+                    &data_block,
+                    budget.max_dict_entries,
+                    budget.max_encoded_size,
+                )
+            })
+        };
+
+        if let Some((indices_data_block, dictionary_data_block)) = dict_result {
+            Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                indices_data_block,
+                repdef,
+                row_number,
+                Some(dictionary_data_block),
+                num_rows,
+                support_large_chunk,
+            )
+        } else if !too_sparse && Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
+            log::debug!(
+                "Encoding column {} with {} items using mini-block layout",
+                column_idx,
+                num_values
+            );
+            Self::encode_miniblock(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                repdef,
+                row_number,
+                None,
+                num_rows,
+                support_large_chunk,
+            )
+        } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
+            log::debug!(
+                "Encoding column {} with {} items using full-zip layout",
+                column_idx,
+                num_values
+            );
+            Self::encode_full_zip(
+                column_idx,
+                &field,
+                compression_strategy.as_ref(),
+                data_block,
+                repdef,
+                row_number,
+                num_rows,
+            )
+        } else {
+            Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
+        }
+    }
+
+    // Creates encode tasks, consuming all buffered data
     fn do_flush(
         &mut self,
         arrays: Vec<ArrayRef>,
@@ -5146,228 +5570,38 @@ impl PrimitiveStructuralEncoder {
         row_number: u64,
         num_rows: u64,
     ) -> Result<Vec<EncodeTask>> {
-        let column_idx = self.column_index;
-        let compression_strategy = self.compression_strategy.clone();
-        let field = self.field.clone();
-        let encoding_metadata = self.encoding_metadata.clone();
-        let support_large_chunk = self.support_large_chunk;
-        let version = self.version;
-        let task = spawn_cpu(move || {
-            let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
-            let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
-            let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-            let repdef = RepDefBuilder::serialize(repdefs);
+        let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
+        let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
+        let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
+        let repdef = RepDefBuilder::serialize(repdefs);
+        let pages =
+            Self::split_sparse_structural_pages(arrays, repdef, row_number, num_rows, num_values)?;
 
-            if num_values == 0 {
-                // We should not encode empty arrays.  So if we get here that should mean that we
-                // either have all empty lists or all null lists (or a mix).  We still need to encode
-                // the rep/def information but we can skip the data encoding.
-                log::debug!("Encoding column {} with {} items ({} rows) using complex-null layout", column_idx, num_values, num_rows);
-                return Self::encode_complex_all_null(
+        let mut tasks = Vec::with_capacity(pages.len());
+        for page in pages {
+            let column_idx = self.column_index;
+            let compression_strategy = self.compression_strategy.clone();
+            let field = self.field.clone();
+            let encoding_metadata = self.encoding_metadata.clone();
+            let support_large_chunk = self.support_large_chunk;
+            let version = self.version;
+            let task = spawn_cpu(move || {
+                Self::encode_page(
                     column_idx,
-                    repdef,
-                    row_number,
-                    num_rows,
+                    field,
+                    compression_strategy,
+                    encoding_metadata,
+                    support_large_chunk,
                     version,
-                    compression_strategy.as_ref(),
-                );
-            }
-
-            let leaf_validity = Self::leaf_validity(&repdef, num_values as usize)?;
-            let all_null = leaf_validity
-                .as_ref()
-                .map(|validity| validity.count_set_bits() == 0)
-                .unwrap_or(false);
-
-            if all_null {
-                return if is_simple_validity {
-                    log::debug!(
-                        "Encoding column {} with {} items ({} rows) using simple-null layout",
-                        column_idx,
-                        num_values,
-                        num_rows
-                    );
-                    Self::encode_simple_all_null(column_idx, num_values, row_number)
-                } else {
-                    log::debug!(
-                        "Encoding column {} with {} items ({} rows) using complex-null layout",
-                        column_idx,
-                        num_values,
-                        num_rows
-                    );
-                    Self::encode_complex_all_null(
-                        column_idx,
-                        repdef,
-                        row_number,
-                        num_rows,
-                        version,
-                        compression_strategy.as_ref(),
-                    )
-                };
-            }
-
-            if let DataType::Struct(fields) = &field.data_type()
-                && fields.is_empty()
-            {
-                if has_repdef_info {
-                    return Err(Error::invalid_input_source(format!("Empty structs with rep/def information are not yet supported.  The field {} is an empty struct that either has nulls or is in a list.", field.name).into()));
-                }
-                // This is maybe a little confusing but the reader should never look at this anyways and it
-                // seems like overkill to invent a new layout just for "empty structs".
-                return Self::encode_simple_all_null(column_idx, num_values, row_number);
-            }
-
-            let data_block = DataBlock::from_arrays(&arrays, num_values);
-
-            if version.resolve() >= LanceFileVersion::V2_2
-                && let Some(scalar) = Self::find_constant_scalar(&arrays, leaf_validity.as_ref())?
-            {
-                log::debug!(
-                    "Encoding column {} with {} items ({} rows) using constant layout",
-                    column_idx,
-                    num_values,
-                    num_rows
-                );
-                return constant::encode_constant_page(
-                    column_idx,
-                    scalar,
-                    repdef,
-                    row_number,
-                    num_rows,
-                );
-            }
-
-            let requires_full_zip_packed_struct =
-                if let DataBlock::Struct(ref struct_data_block) = data_block {
-                    struct_data_block.has_variable_width_child()
-                } else {
-                    false
-                };
-
-            if requires_full_zip_packed_struct {
-                log::debug!(
-                    "Encoding column {} with {} items using full-zip packed struct layout",
-                    column_idx,
-                    num_values
-                );
-                return Self::encode_full_zip(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdef,
-                    row_number,
-                    num_rows,
-                );
-            }
-
-            // If the rep/def levels are too sparse for miniblock (e.g. many empty
-            // lists with very few values), fall back to fullzip to avoid exceeding
-            // the u16 per-chunk rep/def buffer size limit.
-            let too_sparse = Self::repdef_too_sparse_for_miniblock(&repdef, num_values);
-
-            if !too_sparse {
-                if let DataBlock::Dictionary(dict) = data_block {
-                    log::debug!("Encoding column {} with {} items using dictionary encoding (already dictionary encoded)", column_idx, num_values);
-                    let (mut indices_data_block, dictionary_data_block) = dict.into_parts();
-                    // TODO: https://github.com/lancedb/lance/issues/4809
-                    // If we compute stats on dictionary_data_block => panic.
-                    // If we don't compute stats on indices_data_block => panic.
-                    // This is messy.  Don't make me call compute_stat ever.
-                    indices_data_block.compute_stat();
-                    return Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        indices_data_block,
-                        repdef,
-                        row_number,
-                        Some(dictionary_data_block),
-                        num_rows,
-                        support_large_chunk,
-                    );
-                }
-            } else {
-                log::debug!(
-                    "Encoding column {} with {} items using full-zip layout \
-                     (rep/def too sparse for mini-block)",
-                    column_idx,
-                    num_values
-                );
-            }
-
-            {
-                // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
-                // preferred structural encoding.
-                let dict_result = if too_sparse {
-                    None
-                } else {
-                    Self::should_dictionary_encode(&data_block, &field, version)
-                        .and_then(|budget| {
-                            log::debug!(
-                                "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
-                                column_idx,
-                                num_values
-                            );
-                            dict::dictionary_encode(
-                                &data_block,
-                                budget.max_dict_entries,
-                                budget.max_encoded_size,
-                            )
-                        })
-                };
-
-                if let Some((indices_data_block, dictionary_data_block)) = dict_result {
-                    Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        indices_data_block,
-                        repdef,
-                        row_number,
-                        Some(dictionary_data_block),
-                        num_rows,
-                        support_large_chunk,
-                    )
-                } else if !too_sparse && Self::prefers_miniblock(&data_block, encoding_metadata.as_ref()) {
-                    log::debug!(
-                        "Encoding column {} with {} items using mini-block layout",
-                        column_idx,
-                        num_values
-                    );
-                    Self::encode_miniblock(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdef,
-                        row_number,
-                        None,
-                        num_rows,
-                        support_large_chunk,
-                    )
-                } else if too_sparse || Self::prefers_fullzip(encoding_metadata.as_ref()) {
-                    log::debug!(
-                        "Encoding column {} with {} items using full-zip layout",
-                        column_idx,
-                        num_values
-                    );
-                    Self::encode_full_zip(
-                        column_idx,
-                        &field,
-                        compression_strategy.as_ref(),
-                        data_block,
-                        repdef,
-                        row_number,
-                        num_rows,
-                    )
-                } else {
-                    Err(Error::invalid_input_source(format!("Cannot determine structural encoding for field {}.  This typically indicates an invalid value of the field metadata key {}", field.name, STRUCTURAL_ENCODING_META_KEY).into()))
-                }
-            }
-        })
-        .boxed();
-        Ok(vec![task])
+                    is_simple_validity,
+                    has_repdef_info,
+                    page,
+                )
+            })
+            .boxed();
+            tasks.push(task);
+        }
+        Ok(tasks)
     }
 
     fn extract_validity_buf(
