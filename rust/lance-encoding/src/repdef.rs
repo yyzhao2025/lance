@@ -256,12 +256,6 @@ pub struct SerializedRepDefs {
     has_fsl: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StructuralPageSplitCapability {
-    TopLevelRows,
-    RequiresFixedSizeListGrouping,
-}
-
 impl SerializedRepDefs {
     pub fn new(
         repetition_levels: Option<LevelBuffer>,
@@ -320,17 +314,6 @@ impl SerializedRepDefs {
         self.definition_levels
             .as_ref()
             .map(|def| RepDefSlicer::new(self, def.clone()))
-    }
-
-    pub(crate) fn structural_page_split_capability(&self) -> StructuralPageSplitCapability {
-        if self.has_fsl {
-            // FSL levels are serialized using child rows, but pages are addressed by parent rows.
-            // A top-level repeated-row split would be semantically wrong unless it also knew the
-            // FSL grouping dimension.
-            StructuralPageSplitCapability::RequiresFixedSizeListGrouping
-        } else {
-            StructuralPageSplitCapability::TopLevelRows
-        }
     }
 
     pub(crate) fn has_fixed_size_list_levels(&self) -> bool {

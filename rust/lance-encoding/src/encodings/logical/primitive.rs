@@ -58,8 +58,7 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, SerializedRepDefs, StructuralPageSplitCapability,
-        build_control_word_iterator,
+        RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -3770,13 +3769,7 @@ struct PrimitivePageData {
     repdef: SerializedRepDefs,
     row_number: u64,
     num_rows: u64,
-    miniblock_budget: MiniblockBudgetState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MiniblockBudgetState {
-    Fits,
-    UnsplittableOverBudget,
+    unsplittable_miniblock_levels: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3792,7 +3785,7 @@ struct StructuralPageSplit {
 enum StructuralPagePlan {
     Fits,
     Split(Vec<StructuralPageSplit>),
-    UnsplittableOverBudget,
+    UnsplittableOverBudget(u64),
 }
 
 #[derive(Clone)]
@@ -3899,18 +3892,6 @@ impl PrimitiveStructuralEncoder {
         true
     }
 
-    fn user_requested_miniblock(encoding_metadata: &HashMap<String, String>) -> bool {
-        encoding_metadata
-            .get(STRUCTURAL_ENCODING_META_KEY)
-            .is_some_and(|requested| requested.to_lowercase() == STRUCTURAL_ENCODING_MINIBLOCK)
-    }
-
-    fn user_requested_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
-        encoding_metadata
-            .get(STRUCTURAL_ENCODING_META_KEY)
-            .is_some_and(|requested| requested.to_lowercase() == STRUCTURAL_ENCODING_FULLZIP)
-    }
-
     fn fullzip_value_layout_error(data_block: &DataBlock) -> Option<String> {
         match data_block {
             DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
@@ -3960,56 +3941,6 @@ impl PrimitiveStructuralEncoder {
                 other.name()
             )),
         }
-    }
-
-    fn fullzip_value_layout_compatible(data_block: &DataBlock) -> bool {
-        Self::fullzip_value_layout_error(data_block).is_none()
-    }
-
-    fn compressed_fullzip_layout_error(compressed_data: &PerValueDataBlock) -> Option<String> {
-        match compressed_data {
-            PerValueDataBlock::Fixed(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
-                Some(format!(
-                    "Full-zip fixed-width values must be byte aligned, got {} bits per value",
-                    fixed.bits_per_value
-                ))
-            }
-            PerValueDataBlock::Variable(variable)
-                if !variable.bits_per_offset.is_multiple_of(8) =>
-            {
-                Some(format!(
-                    "Full-zip variable-width offsets must be byte aligned, got {} bits per offset",
-                    variable.bits_per_offset
-                ))
-            }
-            PerValueDataBlock::Variable(variable)
-                if variable.bits_per_offset != 32 && variable.bits_per_offset != 64 =>
-            {
-                Some(format!(
-                    "Full-zip variable-width offsets must be 32 or 64 bits, got {} bits",
-                    variable.bits_per_offset
-                ))
-            }
-            PerValueDataBlock::Fixed(_) | PerValueDataBlock::Variable(_) => None,
-        }
-    }
-
-    fn miniblock_repdef_budget_error(repdef: &SerializedRepDefs) -> Error {
-        let num_levels = repdef
-            .repetition_levels
-            .as_ref()
-            .map(|levels| levels.len())
-            .or_else(|| repdef.definition_levels.as_ref().map(|levels| levels.len()))
-            .unwrap_or(0);
-        Error::invalid_input_source(
-            format!(
-                "Mini-block cannot encode {} rep/def levels in one top-level row. \
-                 This usually means the row contains too much nested structure \
-                 for the current layout.",
-                num_levels
-            )
-            .into(),
-        )
     }
 
     // Converts value data, repetition levels, and definition levels into a single
@@ -5051,9 +4982,6 @@ impl PrimitiveStructuralEncoder {
 
         let compressor = compression_strategy.create_per_value(field, &data)?;
         let (compressed_data, value_encoding) = compressor.compress(data)?;
-        if let Some(reason) = Self::compressed_fullzip_layout_error(&compressed_data) {
-            return Err(Error::invalid_input_source(reason.into()));
-        }
 
         let description = match &compressed_data {
             PerValueDataBlock::Fixed(fixed) => ProtobufUtils21::fixed_full_zip_layout(
@@ -5391,9 +5319,7 @@ impl PrimitiveStructuralEncoder {
             return Ok(StructuralPagePlan::Fits);
         }
 
-        if repdef.structural_page_split_capability()
-            == StructuralPageSplitCapability::RequiresFixedSizeListGrouping
-        {
+        if repdef.has_fixed_size_list_levels() {
             // FSL miniblock compression has its own row grouping rules.  Without carrying
             // the FSL dimensions into this planner we cannot safely split or reject here.
             return Ok(StructuralPagePlan::Fits);
@@ -5420,7 +5346,7 @@ impl PrimitiveStructuralEncoder {
         let mut counted_rows = 0u64;
         let mut counted_values = 0u64;
         let mut saw_structural_overhead = false;
-        let mut unsplittable_over_budget = false;
+        let mut unsplittable_over_budget = None;
 
         let mut current_row_level_start = first_row_level_start;
         let mut current_page_row_start = 0u64;
@@ -5437,7 +5363,7 @@ impl PrimitiveStructuralEncoder {
                           counted_rows: &mut u64,
                           counted_values: &mut u64,
                           saw_structural_overhead: &mut bool,
-                          unsplittable_over_budget: &mut bool,
+                          unsplittable_over_budget: &mut Option<u64>,
                           current_row_level_start: &mut usize,
                           current_page_row_start: &mut u64,
                           current_page_num_rows: &mut u64,
@@ -5458,7 +5384,7 @@ impl PrimitiveStructuralEncoder {
             *saw_structural_overhead |= row_has_structural_overhead;
 
             if row_has_structural_overhead && row_num_levels > max_levels {
-                *unsplittable_over_budget = true;
+                *unsplittable_over_budget = Some(row_num_levels);
             }
 
             if *current_page_num_rows > 0
@@ -5545,8 +5471,8 @@ impl PrimitiveStructuralEncoder {
         if !saw_structural_overhead {
             return Ok(StructuralPagePlan::Fits);
         }
-        if unsplittable_over_budget {
-            return Ok(StructuralPagePlan::UnsplittableOverBudget);
+        if let Some(row_num_levels) = unsplittable_over_budget {
+            return Ok(StructuralPagePlan::UnsplittableOverBudget(row_num_levels));
         }
 
         if current_page_num_rows > 0 {
@@ -5580,16 +5506,16 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 row_number,
                 num_rows,
-                miniblock_budget: MiniblockBudgetState::Fits,
+                unsplittable_miniblock_levels: None,
             }]);
         }
-        if plan == StructuralPagePlan::UnsplittableOverBudget {
+        if let StructuralPagePlan::UnsplittableOverBudget(num_levels) = plan {
             return Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
                 row_number,
                 num_rows,
-                miniblock_budget: MiniblockBudgetState::UnsplittableOverBudget,
+                unsplittable_miniblock_levels: Some(num_levels),
             }]);
         }
 
@@ -5606,7 +5532,7 @@ impl PrimitiveStructuralEncoder {
                 repdef,
                 row_number: row_number + split.row_start,
                 num_rows: split.num_rows,
-                miniblock_budget: MiniblockBudgetState::Fits,
+                unsplittable_miniblock_levels: None,
             });
         }
         Ok(pages)
@@ -5628,7 +5554,7 @@ impl PrimitiveStructuralEncoder {
             repdef,
             row_number,
             num_rows,
-            miniblock_budget,
+            unsplittable_miniblock_levels,
         } = page;
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
 
@@ -5711,32 +5637,55 @@ impl PrimitiveStructuralEncoder {
             );
         }
 
-        if miniblock_budget == MiniblockBudgetState::UnsplittableOverBudget {
-            if Self::user_requested_fullzip(encoding_metadata.as_ref())
-                && let Some(reason) = Self::fullzip_value_layout_error(&data_block)
-            {
-                return Err(Error::invalid_input_source(reason.into()));
+        if let Some(num_levels) = unsplittable_miniblock_levels {
+            let requested_encoding = encoding_metadata
+                .get(STRUCTURAL_ENCODING_META_KEY)
+                .map(|requested| requested.to_lowercase());
+            let fullzip_error = Self::fullzip_value_layout_error(&data_block);
+            match requested_encoding.as_deref() {
+                Some(STRUCTURAL_ENCODING_FULLZIP) => {
+                    if let Some(reason) = fullzip_error {
+                        return Err(Error::invalid_input_source(reason.into()));
+                    }
+                    return Self::encode_full_zip(
+                        column_idx,
+                        &field,
+                        compression_strategy.as_ref(),
+                        data_block,
+                        repdef,
+                        row_number,
+                        num_rows,
+                    );
+                }
+                Some(STRUCTURAL_ENCODING_MINIBLOCK) | None => {
+                    if requested_encoding.is_none() && fullzip_error.is_none() {
+                        log::debug!(
+                            "Encoding column {} with {} items using full-zip layout because mini-block cannot split the structural page",
+                            column_idx,
+                            num_values
+                        );
+                        return Self::encode_full_zip(
+                            column_idx,
+                            &field,
+                            compression_strategy.as_ref(),
+                            data_block,
+                            repdef,
+                            row_number,
+                            num_rows,
+                        );
+                    }
+                    return Err(Error::invalid_input_source(
+                        format!(
+                            "Mini-block cannot encode {} rep/def levels in one top-level row. \
+                             This usually means the row contains too much nested structure \
+                             for the current layout.",
+                            num_levels
+                        )
+                        .into(),
+                    ));
+                }
+                _ => {}
             }
-            if !Self::user_requested_miniblock(encoding_metadata.as_ref())
-                && Self::prefers_fullzip(encoding_metadata.as_ref())
-                && Self::fullzip_value_layout_compatible(&data_block)
-            {
-                log::debug!(
-                    "Encoding column {} with {} items using full-zip layout because mini-block cannot split the structural page",
-                    column_idx,
-                    num_values
-                );
-                return Self::encode_full_zip(
-                    column_idx,
-                    &field,
-                    compression_strategy.as_ref(),
-                    data_block,
-                    repdef,
-                    row_number,
-                    num_rows,
-                );
-            }
-            return Err(Self::miniblock_repdef_budget_error(&repdef));
         }
 
         let requires_full_zip_packed_struct =
@@ -5790,10 +5739,7 @@ impl PrimitiveStructuralEncoder {
 
         // Try dictionary encoding first if applicable. If encoding aborts, fall back to the
         // preferred structural encoding.
-        let dict_result = (miniblock_budget == MiniblockBudgetState::Fits)
-            .then(|| Self::should_dictionary_encode(&data_block, &field, version))
-            .flatten()
-            .and_then(|budget| {
+        let dict_result = Self::should_dictionary_encode(&data_block, &field, version).and_then(|budget| {
                 log::debug!(
                     "Encoding column {} with {} items using dictionary encoding (mini-block layout)",
                     column_idx,
