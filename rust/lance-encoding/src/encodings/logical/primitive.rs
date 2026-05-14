@@ -58,7 +58,7 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
+        RepDefSlicer, SerializedRepDefs, StructuralPagePlan, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -3778,32 +3778,6 @@ struct PrimitivePageData {
     unsplittable_miniblock_levels: Option<u64>,
 }
 
-// A contiguous top-level-row range that can be encoded as one structural page.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StructuralPageSplit {
-    // Top-level row offset, relative to the original unsplit page.
-    row_start: u64,
-    // Number of top-level rows in this split.
-    num_rows: u64,
-    // Rep/def level range, relative to the original unsplit page.
-    level_range: Range<usize>,
-    // Visible value offset, relative to the original unsplit page.
-    value_start: u64,
-    // Number of visible values in this split.
-    num_values: u64,
-}
-
-// Planner result for miniblock structural budget handling.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StructuralPagePlan {
-    // The original page can be encoded as-is.
-    Fits,
-    // The original page should be split on top-level row boundaries.
-    Split(Vec<StructuralPageSplit>),
-    // One top-level row is larger than the miniblock rep/def budget.
-    UnsplittableOverBudget(u64),
-}
-
 // Immutable encoder state shared by per-page encode tasks.
 //
 // Cloning this only clones Arc-backed configuration and field metadata.  Page data
@@ -3885,29 +3859,6 @@ impl PrimitiveStructuralEncoder {
         }
         // Otherwise only use miniblock if it is narrow
         Self::is_narrow(data_block)
-    }
-
-    fn repdef_bits_per_level(repdef: &SerializedRepDefs) -> Option<u64> {
-        let bits_per_rep = repdef
-            .repetition_levels
-            .as_ref()
-            .and_then(|r| r.iter().max().copied())
-            .map(|max_val| u16::BITS - max_val.leading_zeros())
-            .unwrap_or(0) as u64;
-        let bits_per_def = repdef
-            .definition_levels
-            .as_ref()
-            .and_then(|d| d.iter().max().copied())
-            .map(|max_val| u16::BITS - max_val.leading_zeros())
-            .unwrap_or(0) as u64;
-
-        let bits_per_level = bits_per_rep + bits_per_def;
-        (bits_per_level > 0).then_some(bits_per_level)
-    }
-
-    fn max_repdef_levels_per_miniblock(repdef: &SerializedRepDefs) -> Option<u64> {
-        let bits_per_level = Self::repdef_bits_per_level(repdef)?;
-        Some(miniblock::max_repdef_levels_per_chunk(bits_per_level))
     }
 
     fn prefers_fullzip(encoding_metadata: &HashMap<String, String>) -> bool {
@@ -5258,171 +5209,13 @@ impl PrimitiveStructuralEncoder {
         Ok(sliced)
     }
 
-    fn plan_structural_page_splits(
-        repdef: &SerializedRepDefs,
-        num_rows: u64,
-        num_values: u64,
-    ) -> Result<StructuralPagePlan> {
-        if num_values == 0 {
-            return Ok(StructuralPagePlan::Fits);
-        }
-        let Some(max_levels) = Self::max_repdef_levels_per_miniblock(repdef) else {
-            return Ok(StructuralPagePlan::Fits);
-        };
-        let Some(max_visible_level) = repdef.max_visible_level else {
-            return Ok(StructuralPagePlan::Fits);
-        };
-        let Some(rep) = repdef.repetition_levels.as_ref() else {
-            return Ok(StructuralPagePlan::Fits);
-        };
-        let Some(def) = repdef.definition_levels.as_ref() else {
-            return Ok(StructuralPagePlan::Fits);
-        };
-
-        if rep.len() != def.len() {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits with mismatched rep/def levels: rep={}, def={}",
-                rep.len(),
-                def.len()
-            )));
-        }
-
-        let max_rep = repdef
-            .def_meaning
-            .iter()
-            .filter(|level| level.is_list())
-            .count() as u16;
-        if max_rep == 0 {
-            return Ok(StructuralPagePlan::Fits);
-        }
-
-        if repdef.has_fixed_size_list_levels() {
-            // FSL miniblock compression has its own row grouping rules.  Without carrying
-            // the FSL dimensions into this planner we cannot safely split or reject here.
-            return Ok(StructuralPagePlan::Fits);
-        }
-
-        let mut row_start_positions = rep
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, rep_level)| (*rep_level == max_rep).then_some(idx));
-        let Some(first_row_level_start) = row_start_positions.next() else {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits: expected {} top-level row starts, found 0",
-                num_rows
-            )));
-        };
-        if first_row_level_start != 0 {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits: first top-level row starts at level {}, expected 0",
-                first_row_level_start
-            )));
-        }
-
-        let mut splits = Vec::new();
-        let mut counted_rows = 0u64;
-        let mut counted_values = 0u64;
-        let mut saw_structural_overhead = false;
-        let mut unsplittable_over_budget = None;
-
-        let mut current_row_level_start = first_row_level_start;
-        let mut current_page_row_start = 0u64;
-        let mut current_page_num_rows = 0u64;
-        let mut current_page_level_start = first_row_level_start;
-        let mut current_page_level_end = first_row_level_start;
-        let mut current_page_value_start = 0u64;
-        let mut current_page_num_values = 0u64;
-        let mut current_page_num_levels = 0u64;
-        let mut current_page_has_structural_overhead = false;
-
-        for row_level_end in row_start_positions.chain(std::iter::once(rep.len())) {
-            let row_level_range = current_row_level_start..row_level_end;
-            let row_num_levels = (row_level_end - current_row_level_start) as u64;
-            let row_num_values = def[row_level_range]
-                .iter()
-                .filter(|def_level| **def_level <= max_visible_level)
-                .count() as u64;
-            let row_has_structural_overhead = row_num_levels > row_num_values;
-            saw_structural_overhead |= row_has_structural_overhead;
-
-            if row_has_structural_overhead && row_num_levels > max_levels {
-                unsplittable_over_budget = Some(row_num_levels);
-            }
-
-            if current_page_num_rows > 0
-                && (current_page_has_structural_overhead || row_has_structural_overhead)
-                && current_page_num_levels + row_num_levels > max_levels
-            {
-                splits.push(StructuralPageSplit {
-                    row_start: current_page_row_start,
-                    num_rows: current_page_num_rows,
-                    level_range: current_page_level_start..current_page_level_end,
-                    value_start: current_page_value_start,
-                    num_values: current_page_num_values,
-                });
-                current_page_row_start = counted_rows;
-                current_page_num_rows = 0;
-                current_page_level_start = current_row_level_start;
-                current_page_value_start = counted_values;
-                current_page_num_values = 0;
-                current_page_num_levels = 0;
-                current_page_has_structural_overhead = false;
-            }
-
-            current_page_num_rows += 1;
-            current_page_level_end = row_level_end;
-            current_page_num_values += row_num_values;
-            current_page_num_levels += row_num_levels;
-            current_page_has_structural_overhead |= row_has_structural_overhead;
-            counted_rows += 1;
-            counted_values += row_num_values;
-            current_row_level_start = row_level_end;
-        }
-
-        if counted_rows != num_rows {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits: expected {} top-level row starts, found {}",
-                num_rows, counted_rows
-            )));
-        }
-        if counted_values != num_values {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits: counted {} visible values, expected {}",
-                counted_values, num_values
-            )));
-        }
-        if !saw_structural_overhead {
-            return Ok(StructuralPagePlan::Fits);
-        }
-        if let Some(row_num_levels) = unsplittable_over_budget {
-            return Ok(StructuralPagePlan::UnsplittableOverBudget(row_num_levels));
-        }
-
-        if current_page_num_rows > 0 {
-            splits.push(StructuralPageSplit {
-                row_start: current_page_row_start,
-                num_rows: current_page_num_rows,
-                level_range: current_page_level_start..current_page_level_end,
-                value_start: current_page_value_start,
-                num_values: current_page_num_values,
-            });
-        }
-
-        if splits.len() > 1 {
-            Ok(StructuralPagePlan::Split(splits))
-        } else {
-            Ok(StructuralPagePlan::Fits)
-        }
-    }
-
     fn split_structural_pages_for_miniblock_budget(
         arrays: Vec<ArrayRef>,
         repdef: SerializedRepDefs,
+        plan: StructuralPagePlan,
         row_number: u64,
         num_rows: u64,
-        num_values: u64,
     ) -> Result<Vec<PrimitivePageData>> {
-        let plan = Self::plan_structural_page_splits(&repdef, num_rows, num_values)?;
         if plan == StructuralPagePlan::Fits {
             return Ok(vec![PrimitivePageData {
                 arrays,
@@ -5787,9 +5580,20 @@ impl PrimitiveStructuralEncoder {
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-        let repdef = RepDefBuilder::serialize(repdefs);
+        let (repdef, structural_summary) =
+            RepDefBuilder::serialize_with_structural_summary(repdefs)?;
+        let structural_plan = structural_summary
+            .bits_per_level()
+            .map(miniblock::max_repdef_levels_per_chunk)
+            .map(|max_levels| structural_summary.plan_splits(max_levels, num_rows, num_values))
+            .transpose()?
+            .unwrap_or(StructuralPagePlan::Fits);
         let pages = Self::split_structural_pages_for_miniblock_budget(
-            arrays, repdef, row_number, num_rows, num_values,
+            arrays,
+            repdef,
+            structural_plan,
+            row_number,
+            num_rows,
         )?;
 
         let mut tasks = Vec::with_capacity(pages.len());
