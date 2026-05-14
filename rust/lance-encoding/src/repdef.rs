@@ -108,7 +108,6 @@
 
 use std::{
     iter::{Copied, Zip},
-    ops::Range,
     sync::Arc,
 };
 
@@ -254,39 +253,13 @@ pub struct SerializedRepDefs {
     ///
     /// This is None if there are no lists
     pub max_visible_level: Option<u16>,
-    pub(crate) has_fsl: bool,
+    has_fsl: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RepDefRowSlice {
-    pub(crate) row_start: u64,
-    pub(crate) num_rows: u64,
-    pub(crate) level_range: Range<usize>,
-    pub(crate) value_start: u64,
-    pub(crate) num_values: u64,
-}
-
-impl RepDefRowSlice {
-    pub(crate) fn num_levels(&self) -> u64 {
-        (self.level_range.end - self.level_range.start) as u64
-    }
-
-    pub(crate) fn has_structural_overhead(&self) -> bool {
-        self.num_levels() > self.num_values
-    }
-
-    pub(crate) fn merge_contiguous(row_slices: &[Self]) -> Self {
-        debug_assert!(!row_slices.is_empty());
-        let first = row_slices.first().unwrap();
-        let last = row_slices.last().unwrap();
-        Self {
-            row_start: first.row_start,
-            num_rows: row_slices.len() as u64,
-            level_range: first.level_range.start..last.level_range.end,
-            value_start: first.value_start,
-            num_values: row_slices.iter().map(|row| row.num_values).sum(),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StructuralPageSplitCapability {
+    TopLevelRows,
+    RequiresFixedSizeListGrouping,
 }
 
 impl SerializedRepDefs {
@@ -295,10 +268,15 @@ impl SerializedRepDefs {
         definition_levels: Option<LevelBuffer>,
         def_meaning: Vec<DefinitionInterpretation>,
     ) -> Self {
-        Self::new_with_has_fsl(repetition_levels, definition_levels, def_meaning, false)
+        Self::new_with_fixed_size_list_levels(
+            repetition_levels,
+            definition_levels,
+            def_meaning,
+            false,
+        )
     }
 
-    pub(crate) fn new_with_has_fsl(
+    pub(crate) fn new_with_fixed_size_list_levels(
         repetition_levels: Option<LevelBuffer>,
         definition_levels: Option<LevelBuffer>,
         def_meaning: Vec<DefinitionInterpretation>,
@@ -344,91 +322,19 @@ impl SerializedRepDefs {
             .map(|def| RepDefSlicer::new(self, def.clone()))
     }
 
-    /// Returns the rep/def and value ranges for each top-level row.
-    ///
-    /// This is only available for structures with repetition and definition
-    /// levels.  Fixed-size/non-repeated values do not need structural page
-    /// planning and return `Ok(None)`.
-    pub(crate) fn top_level_row_slices(
-        &self,
-        num_rows: u64,
-        num_values: u64,
-    ) -> Result<Option<Vec<RepDefRowSlice>>> {
-        let Some(max_visible_level) = self.max_visible_level else {
-            return Ok(None);
-        };
-        let Some(rep) = self.repetition_levels.as_ref() else {
-            return Ok(None);
-        };
-        let Some(def) = self.definition_levels.as_ref() else {
-            return Ok(None);
-        };
-
-        if rep.len() != def.len() {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits with mismatched rep/def levels: rep={}, def={}",
-                rep.len(),
-                def.len()
-            )));
+    pub(crate) fn structural_page_split_capability(&self) -> StructuralPageSplitCapability {
+        if self.has_fsl {
+            // FSL levels are serialized using child rows, but pages are addressed by parent rows.
+            // A top-level repeated-row split would be semantically wrong unless it also knew the
+            // FSL grouping dimension.
+            StructuralPageSplitCapability::RequiresFixedSizeListGrouping
+        } else {
+            StructuralPageSplitCapability::TopLevelRows
         }
+    }
 
-        let max_rep = self
-            .def_meaning
-            .iter()
-            .filter(|level| level.is_list())
-            .count() as u16;
-        if max_rep == 0 {
-            return Ok(None);
-        }
-
-        let expected_rows = usize::try_from(num_rows).map_err(|_| {
-            Error::internal(format!(
-                "Cannot plan structural page splits for {} rows on this platform",
-                num_rows
-            ))
-        })?;
-
-        let mut row_starts = Vec::with_capacity(expected_rows + 1);
-        for (idx, rep_level) in rep.iter().enumerate() {
-            if *rep_level == max_rep {
-                row_starts.push(idx);
-            }
-        }
-        if row_starts.len() != expected_rows {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits: expected {} top-level row starts, found {}",
-                expected_rows,
-                row_starts.len()
-            )));
-        }
-        row_starts.push(rep.len());
-
-        let mut value_start = 0u64;
-        let mut slices = Vec::with_capacity(expected_rows);
-        for row_idx in 0..expected_rows {
-            let level_range = row_starts[row_idx]..row_starts[row_idx + 1];
-            let num_row_values = def[level_range.clone()]
-                .iter()
-                .filter(|def_level| **def_level <= max_visible_level)
-                .count() as u64;
-            slices.push(RepDefRowSlice {
-                row_start: row_idx as u64,
-                num_rows: 1,
-                level_range,
-                value_start,
-                num_values: num_row_values,
-            });
-            value_start += num_row_values;
-        }
-
-        if value_start != num_values {
-            return Err(Error::internal(format!(
-                "Cannot plan structural page splits: counted {} visible values, expected {}",
-                value_start, num_values
-            )));
-        }
-
-        Ok(Some(slices))
+    pub(crate) fn has_fixed_size_list_levels(&self) -> bool {
+        self.has_fsl
     }
 }
 
@@ -882,7 +788,12 @@ impl SerializerContext {
 
     fn build(mut self) -> SerializedRepDefs {
         if self.current_len == 0 {
-            return SerializedRepDefs::new_with_has_fsl(None, None, self.def_meaning, self.has_fsl);
+            return SerializedRepDefs::new_with_fixed_size_list_levels(
+                None,
+                None,
+                self.def_meaning,
+                self.has_fsl,
+            );
         }
 
         self.normalize_specials();
@@ -901,7 +812,7 @@ impl SerializerContext {
         // Need to reverse the def meaning since we build rep / def levels in reverse
         let def_meaning = self.def_meaning.into_iter().rev().collect::<Vec<_>>();
 
-        SerializedRepDefs::new_with_has_fsl(
+        SerializedRepDefs::new_with_fixed_size_list_levels(
             repetition_levels,
             definition_levels,
             def_meaning,

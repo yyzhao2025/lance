@@ -353,6 +353,19 @@ mod tests {
         }
     }
 
+    fn assert_has_fullzip_layout(pages: &[crate::encoder::EncodedPage]) {
+        let has_fullzip = pages.iter().any(|page| {
+            let crate::decoder::PageEncoding::Structural(layout) = &page.description else {
+                return false;
+            };
+            matches!(
+                layout.layout.as_ref().unwrap(),
+                crate::format::pb21::page_layout::Layout::FullZipLayout(_)
+            )
+        });
+        assert!(has_fullzip, "expected at least one full-zip page");
+    }
+
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_list(
@@ -1213,9 +1226,44 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("Mini-block cannot encode")
-                || err.to_string().contains("byte aligned"),
+            err.to_string().contains("Mini-block cannot encode"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nested_sparse_string_single_row_falls_back_to_fullzip() {
+        let empty_inner_lists = 70_000usize;
+
+        let mut inner_offsets = vec![0i32; empty_inner_lists + 1];
+        inner_offsets.push(1);
+        inner_offsets.push(2);
+
+        let mut strings = StringBuilder::new();
+        strings.append_value("value");
+        strings.append_value("other");
+        let inner_items = strings.finish();
+        let inner_list = ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(ScalarBuffer::from(inner_offsets)),
+            Arc::new(inner_items),
+            None,
+        );
+        let outer_list = ListArray::new(
+            Arc::new(Field::new("item", inner_list.data_type().clone(), true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0i32, empty_inner_lists as i32 + 2])),
+            Arc::new(inner_list),
+            None,
+        );
+
+        let outer_list = Arc::new(outer_list) as ArrayRef;
+        let pages = encode_v22_pages(outer_list.clone()).await;
+        assert_has_fullzip_layout(&pages);
+
+        let test_cases = TestCases::default()
+            .with_range(0..1)
+            .with_indices(vec![0])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        check_round_trip_encoding_of_data(vec![outer_list], &test_cases, HashMap::new()).await;
     }
 }
