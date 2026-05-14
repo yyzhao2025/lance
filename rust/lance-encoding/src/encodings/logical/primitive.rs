@@ -5580,14 +5580,12 @@ impl PrimitiveStructuralEncoder {
         let num_values = arrays.iter().map(|arr| arr.len() as u64).sum();
         let is_simple_validity = repdefs.iter().all(|rd| rd.is_simple_validity());
         let has_repdef_info = repdefs.iter().any(|rd| !rd.is_empty());
-        let (repdef, structural_summary) =
-            RepDefBuilder::serialize_with_structural_summary(repdefs)?;
-        let structural_plan = structural_summary
-            .bits_per_level()
-            .map(miniblock::max_repdef_levels_per_chunk)
-            .map(|max_levels| structural_summary.plan_splits(max_levels, num_rows, num_values))
-            .transpose()?
-            .unwrap_or(StructuralPagePlan::Fits);
+        let (repdef, structural_plan) = RepDefBuilder::serialize_with_structural_plan(
+            repdefs,
+            miniblock::max_repdef_levels_per_chunk,
+            num_rows,
+            num_values,
+        )?;
         let pages = Self::split_structural_pages_for_miniblock_budget(
             arrays,
             repdef,
