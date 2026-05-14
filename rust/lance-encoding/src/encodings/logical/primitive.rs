@@ -59,7 +59,7 @@ use crate::{
 use crate::{
     repdef::{
         CompositeRepDefUnraveler, ControlWordIterator, ControlWordParser, DefinitionInterpretation,
-        RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
+        RepDefRowSlice, RepDefSlicer, SerializedRepDefs, build_control_word_iterator,
     },
     utils::accumulation::AccumulationQueue,
 };
@@ -3764,13 +3764,16 @@ struct PrimitivePageData {
     num_rows: u64,
 }
 
-#[derive(Debug)]
-struct PrimitivePageSplit {
-    row_start: u64,
-    num_rows: u64,
-    level_range: Range<usize>,
-    value_start: u64,
-    num_values: u64,
+#[derive(Clone)]
+struct PrimitiveEncodeContext {
+    column_idx: u32,
+    field: Field,
+    compression_strategy: Arc<dyn CompressionStrategy>,
+    encoding_metadata: Arc<HashMap<String, String>>,
+    support_large_chunk: bool,
+    version: LanceFileVersion,
+    is_simple_validity: bool,
+    has_repdef_info: bool,
 }
 
 impl PrimitiveStructuralEncoder {
@@ -3832,36 +3835,16 @@ impl PrimitiveStructuralEncoder {
         Self::is_narrow(data_block)
     }
 
-    /// Checks if the rep/def levels are too sparse for miniblock encoding.
-    ///
-    /// Miniblock chunks are limited to ~32KiB total. Data can use up to ~16KiB,
-    /// leaving ~16KiB for both rep and def buffers combined. Each chunk has at most
-    /// MAX_MINIBLOCK_VALUES (4096) data values, but when data has many empty/null
-    /// lists, the number of rep/def levels can far exceed the number of data values
-    /// (each empty list adds a level entry with no corresponding data value).
-    ///
-    /// We estimate the compressed bits per level by computing the max value in each
-    /// buffer and taking ceil(log2(max_val + 1)) — the minimum bits needed to
-    /// bitpack each level. We then calculate the maximum number of levels that fit
-    /// in 16KiB and compare against the actual levels-to-values ratio.
-    fn repdef_too_sparse_for_miniblock(
-        repdef: &crate::repdef::SerializedRepDefs,
-        num_values: u64,
-    ) -> bool {
-        if num_values == 0 {
-            return false;
-        }
-        let num_levels = repdef
+    fn repdef_level_count(repdef: &SerializedRepDefs) -> u64 {
+        repdef
             .repetition_levels
             .as_ref()
             .map(|r| r.len() as u64)
             .max(repdef.definition_levels.as_ref().map(|d| d.len() as u64))
-            .unwrap_or(0);
-        if num_levels == 0 {
-            return false;
-        }
+            .unwrap_or(0)
+    }
 
-        // Compute bits needed per level for each buffer (ceil of log2(max+1))
+    fn repdef_bits_per_level(repdef: &SerializedRepDefs) -> Option<u64> {
         let bits_per_rep = repdef
             .repetition_levels
             .as_ref()
@@ -3876,13 +3859,39 @@ impl PrimitiveStructuralEncoder {
             .unwrap_or(0) as u64;
 
         let bits_per_level = bits_per_rep + bits_per_def;
-        if bits_per_level == 0 {
-            return false;
-        }
+        (bits_per_level > 0).then_some(bits_per_level)
+    }
 
+    fn max_repdef_levels_per_miniblock(repdef: &SerializedRepDefs) -> Option<u64> {
+        let bits_per_level = Self::repdef_bits_per_level(repdef)?;
         // 16KiB budget for rep+def combined (half the ~32KiB chunk limit)
         const REPDEF_BUDGET_BITS: u64 = 16 * 1024 * 8;
-        let max_levels_per_chunk = REPDEF_BUDGET_BITS / bits_per_level;
+        let budgeted_levels = REPDEF_BUDGET_BITS / bits_per_level;
+
+        // The serialized level chunk header stores the level count in u16.
+        Some(budgeted_levels.min(u16::MAX as u64))
+    }
+
+    /// Checks if the rep/def levels are too sparse for miniblock encoding.
+    ///
+    /// Miniblock value chunks have at most MAX_MINIBLOCK_VALUES (4096) data
+    /// values, but sparse list structure can add many rep/def levels with no
+    /// corresponding value.  This estimates whether an average value chunk would
+    /// exceed the rep/def level budget.
+    fn repdef_too_sparse_for_miniblock(repdef: &SerializedRepDefs, num_values: u64) -> bool {
+        if num_values == 0 {
+            return false;
+        }
+        let num_levels = Self::repdef_level_count(repdef);
+        if num_levels == 0 {
+            return false;
+        }
+        let Some(max_levels_per_chunk) = Self::max_repdef_levels_per_miniblock(repdef) else {
+            return false;
+        };
+        if num_levels <= max_levels_per_chunk {
+            return false;
+        }
 
         // A chunk has at most MAX_MINIBLOCK_VALUES data values. The levels-to-values
         // ratio tells us how many levels a chunk of that size would need.
@@ -4193,9 +4202,20 @@ impl PrimitiveStructuralEncoder {
             chunk_fixed_width.compute_stat();
             let chunk_levels_block = DataBlock::FixedWidth(chunk_fixed_width);
             let compressed_levels = compressor.compress(chunk_levels_block)?;
+            let num_levels = u16::try_from(num_chunk_levels).map_err(|_| {
+                Error::invalid_input_source(
+                    format!(
+                        "Mini-block cannot encode {} rep/def levels in one chunk. \
+                         This usually means a top-level row contains too much nested structure \
+                         for the current layout.",
+                        num_chunk_levels
+                    )
+                    .into(),
+                )
+            })?;
             level_chunks.push(CompressedLevelsChunk {
                 data: compressed_levels,
-                num_levels: num_chunk_levels as u16,
+                num_levels,
             });
         }
         debug_assert_eq!(levels.num_levels_remaining(), 0);
@@ -4687,7 +4707,17 @@ impl PrimitiveStructuralEncoder {
         fixed: FixedWidthDataBlock,
         mut repdef: ControlWordIterator,
         num_values: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
+        if !fixed.bits_per_value.is_multiple_of(8) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Full-zip fixed-width values must be byte aligned, got {} bits per value",
+                    fixed.bits_per_value
+                )
+                .into(),
+            ));
+        }
+
         let len = fixed.data.len() + repdef.bytes_per_word() * num_values as usize;
         let mut zipped_data = Vec::with_capacity(len);
 
@@ -4699,14 +4729,6 @@ impl PrimitiveStructuralEncoder {
         };
         let mut rep_index_builder =
             BytepackedIntegerEncoder::with_capacity(num_values as usize + 1, max_rep_index_val);
-
-        // I suppose we can just pad to the nearest byte but I'm not sure we need to worry about this anytime soon
-        // because it is unlikely compression of large values is going to yield a result that is not byte aligned
-        assert_eq!(
-            fixed.bits_per_value % 8,
-            0,
-            "Non-byte aligned full-zip compression not yet supported"
-        );
 
         let bytes_per_value = fixed.bits_per_value as usize / 8;
         let mut offset = 0;
@@ -4754,10 +4776,10 @@ impl PrimitiveStructuralEncoder {
         } else {
             Some(LanceBuffer::from(rep_index))
         };
-        SerializedFullZip {
+        Ok(SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
-        }
+        })
     }
 
     // For variable-size data we encode < control word | length | data > for each value
@@ -4767,13 +4789,17 @@ impl PrimitiveStructuralEncoder {
         variable: VariableWidthBlock,
         mut repdef: ControlWordIterator,
         num_items: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
         let bytes_per_offset = variable.bits_per_offset as usize / 8;
-        assert_eq!(
-            variable.bits_per_offset % 8,
-            0,
-            "Only byte-aligned offsets supported"
-        );
+        if !variable.bits_per_offset.is_multiple_of(8) {
+            return Err(Error::invalid_input_source(
+                format!(
+                    "Full-zip variable-width offsets must be byte aligned, got {} bits per offset",
+                    variable.bits_per_offset
+                )
+                .into(),
+            ));
+        }
         let len = variable.data.len()
             + repdef.bytes_per_word() * num_items as usize
             + bytes_per_offset * variable.num_values as usize;
@@ -4831,7 +4857,15 @@ impl PrimitiveStructuralEncoder {
                     rep_offset = buf.len();
                 }
             }
-            _ => panic!("Unsupported offset size"),
+            _ => {
+                return Err(Error::invalid_input_source(
+                    format!(
+                        "Full-zip variable-width offsets must be 32 or 64 bits, got {} bits",
+                        variable.bits_per_offset
+                    )
+                    .into(),
+                ));
+            }
         }
 
         // We might have saved a few bytes by not copying lengths when the length was zero.  However,
@@ -4847,10 +4881,10 @@ impl PrimitiveStructuralEncoder {
         let rep_index = rep_index_builder.into_data();
         debug_assert!(!rep_index.is_empty());
         let rep_index = Some(LanceBuffer::from(rep_index));
-        SerializedFullZip {
+        Ok(SerializedFullZip {
             values: zipped_data,
             repetition_index: rep_index,
-        }
+        })
     }
 
     /// Serializes data into a single buffer according to the full-zip format which zips
@@ -4859,7 +4893,7 @@ impl PrimitiveStructuralEncoder {
         compressed_data: PerValueDataBlock,
         repdef: ControlWordIterator,
         num_items: u64,
-    ) -> SerializedFullZip {
+    ) -> Result<SerializedFullZip> {
         match compressed_data {
             PerValueDataBlock::Fixed(fixed) => {
                 Self::serialize_full_zip_fixed(fixed, repdef, num_items)
@@ -4938,7 +4972,7 @@ impl PrimitiveStructuralEncoder {
             ),
         };
 
-        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items);
+        let zipped = Self::serialize_full_zip(compressed_data, repdef_iter, num_items)?;
 
         let data = if let Some(repindex) = zipped.repetition_index {
             vec![zipped.values, repindex]
@@ -5214,83 +5248,61 @@ impl PrimitiveStructuralEncoder {
         Ok(sliced)
     }
 
+    fn row_slice_num_levels(row: &RepDefRowSlice) -> u64 {
+        (row.level_range.end - row.level_range.start) as u64
+    }
+
+    fn merge_row_slices(row_slices: &[RepDefRowSlice]) -> RepDefRowSlice {
+        debug_assert!(!row_slices.is_empty());
+        let first = row_slices.first().unwrap();
+        let last = row_slices.last().unwrap();
+        RepDefRowSlice {
+            row_start: first.row_start,
+            num_rows: row_slices.len() as u64,
+            level_range: first.level_range.start..last.level_range.end,
+            value_start: first.value_start,
+            num_values: row_slices.iter().map(|row| row.num_values).sum(),
+        }
+    }
+
     fn plan_structural_page_splits(
         repdef: &SerializedRepDefs,
         num_rows: u64,
         num_values: u64,
-    ) -> Option<Vec<PrimitivePageSplit>> {
-        let max_visible_level = repdef.max_visible_level?;
-        let rep = repdef.repetition_levels.as_ref()?;
-        let def = repdef.definition_levels.as_ref()?;
-        let max_rep = repdef
-            .def_meaning
-            .iter()
-            .filter(|level| level.is_list())
-            .count() as u16;
-        if max_rep == 0 {
-            return None;
+    ) -> Result<Option<Vec<RepDefRowSlice>>> {
+        let Some(max_levels) = Self::max_repdef_levels_per_miniblock(repdef) else {
+            return Ok(None);
+        };
+        let too_sparse = Self::repdef_too_sparse_for_miniblock(repdef, num_values);
+        let has_long_zero_value_run = !too_sparse
+            && Self::repdef_level_count(repdef) > max_levels
+            && repdef.has_top_level_zero_value_run_over(max_levels, num_rows, num_values)?;
+        if !too_sparse && !has_long_zero_value_run {
+            return Ok(None);
         }
 
-        let num_rows = usize::try_from(num_rows).ok()?;
-        let mut row_starts = Vec::with_capacity(num_rows + 1);
-        for (idx, rep_level) in rep.iter().enumerate() {
-            if *rep_level == max_rep {
-                row_starts.push(idx);
-            }
-        }
-        if row_starts.len() != num_rows {
-            return None;
-        }
-        row_starts.push(rep.len());
-
-        let mut row_values = Vec::with_capacity(num_rows);
-        let mut total_visible_values = 0u64;
-        for row_idx in 0..num_rows {
-            let level_range = row_starts[row_idx]..row_starts[row_idx + 1];
-            let visible_values = def[level_range]
-                .iter()
-                .filter(|def_level| **def_level <= max_visible_level)
-                .count() as u64;
-            row_values.push(visible_values);
-            total_visible_values += visible_values;
-        }
-        if total_visible_values != num_values {
-            return None;
+        let Some(row_slices) = repdef.top_level_row_slices(num_rows, num_values)? else {
+            return Ok(None);
+        };
+        if row_slices.len() <= 1 {
+            return Ok(None);
         }
 
         let mut splits = Vec::new();
-        let mut run_start_row = 0usize;
-        let mut run_value_start = 0u64;
-        let mut run_values = 0u64;
-        let mut run_is_empty = row_values.first().copied()? == 0;
-
-        for (row_idx, row_visible_values) in row_values.iter().copied().enumerate() {
-            let row_is_empty = row_visible_values == 0;
-            if row_idx > run_start_row && row_is_empty != run_is_empty {
-                splits.push(PrimitivePageSplit {
-                    row_start: run_start_row as u64,
-                    num_rows: (row_idx - run_start_row) as u64,
-                    level_range: row_starts[run_start_row]..row_starts[row_idx],
-                    value_start: run_value_start,
-                    num_values: run_values,
-                });
-                run_start_row = row_idx;
-                run_value_start += run_values;
-                run_values = 0;
-                run_is_empty = row_is_empty;
+        let mut current_start = 0usize;
+        let mut current_levels = 0u64;
+        for (row_idx, row) in row_slices.iter().enumerate() {
+            let row_levels = Self::row_slice_num_levels(row);
+            if row_idx > current_start && current_levels + row_levels > max_levels {
+                splits.push(Self::merge_row_slices(&row_slices[current_start..row_idx]));
+                current_start = row_idx;
+                current_levels = 0;
             }
-            run_values += row_visible_values;
+            current_levels += row_levels;
         }
+        splits.push(Self::merge_row_slices(&row_slices[current_start..]));
 
-        splits.push(PrimitivePageSplit {
-            row_start: run_start_row as u64,
-            num_rows: (num_rows - run_start_row) as u64,
-            level_range: row_starts[run_start_row]..*row_starts.last().unwrap(),
-            value_start: run_value_start,
-            num_values: run_values,
-        });
-
-        (splits.len() > 1).then_some(splits)
+        Ok((splits.len() > 1).then_some(splits))
     }
 
     fn split_sparse_structural_pages(
@@ -5300,16 +5312,7 @@ impl PrimitiveStructuralEncoder {
         num_rows: u64,
         num_values: u64,
     ) -> Result<Vec<PrimitivePageData>> {
-        if !Self::repdef_too_sparse_for_miniblock(&repdef, num_values) {
-            return Ok(vec![PrimitivePageData {
-                arrays,
-                repdef,
-                row_number,
-                num_rows,
-            }]);
-        }
-
-        let Some(splits) = Self::plan_structural_page_splits(&repdef, num_rows, num_values) else {
+        let Some(splits) = Self::plan_structural_page_splits(&repdef, num_rows, num_values)? else {
             return Ok(vec![PrimitivePageData {
                 arrays,
                 repdef,
@@ -5332,18 +5335,17 @@ impl PrimitiveStructuralEncoder {
         Ok(pages)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encode_page(
-        column_idx: u32,
-        field: Field,
-        compression_strategy: Arc<dyn CompressionStrategy>,
-        encoding_metadata: Arc<HashMap<String, String>>,
-        support_large_chunk: bool,
-        version: LanceFileVersion,
-        is_simple_validity: bool,
-        has_repdef_info: bool,
-        page: PrimitivePageData,
-    ) -> Result<EncodedPage> {
+    fn encode_page(ctx: PrimitiveEncodeContext, page: PrimitivePageData) -> Result<EncodedPage> {
+        let PrimitiveEncodeContext {
+            column_idx,
+            field,
+            compression_strategy,
+            encoding_metadata,
+            support_large_chunk,
+            version,
+            is_simple_validity,
+            has_repdef_info,
+        } = ctx;
         let PrimitivePageData {
             arrays,
             repdef,
@@ -5578,27 +5580,19 @@ impl PrimitiveStructuralEncoder {
             Self::split_sparse_structural_pages(arrays, repdef, row_number, num_rows, num_values)?;
 
         let mut tasks = Vec::with_capacity(pages.len());
+        let ctx = PrimitiveEncodeContext {
+            column_idx: self.column_index,
+            field: self.field.clone(),
+            compression_strategy: self.compression_strategy.clone(),
+            encoding_metadata: self.encoding_metadata.clone(),
+            support_large_chunk: self.support_large_chunk,
+            version: self.version,
+            is_simple_validity,
+            has_repdef_info,
+        };
         for page in pages {
-            let column_idx = self.column_index;
-            let compression_strategy = self.compression_strategy.clone();
-            let field = self.field.clone();
-            let encoding_metadata = self.encoding_metadata.clone();
-            let support_large_chunk = self.support_large_chunk;
-            let version = self.version;
-            let task = spawn_cpu(move || {
-                Self::encode_page(
-                    column_idx,
-                    field,
-                    compression_strategy,
-                    encoding_metadata,
-                    support_large_chunk,
-                    version,
-                    is_simple_validity,
-                    has_repdef_info,
-                    page,
-                )
-            })
-            .boxed();
+            let ctx = ctx.clone();
+            let task = spawn_cpu(move || Self::encode_page(ctx, page)).boxed();
             tasks.push(task);
         }
         Ok(tasks)
@@ -5719,6 +5713,7 @@ mod tests {
     use crate::format::ProtobufUtils21;
     use crate::format::pb21;
     use crate::format::pb21::compressive_encoding::Compression;
+    use crate::repdef::build_control_word_iterator;
     use crate::testing::{TestCases, check_round_trip_encoding_of_data};
     use crate::version::LanceFileVersion;
     use arrow_array::{ArrayRef, Int8Array, StringArray};
@@ -5744,6 +5739,26 @@ mod tests {
         ]);
         let block = DataBlock::from_array(string_array);
         assert!((!PrimitiveStructuralEncoder::is_narrow(&block)));
+    }
+
+    #[test]
+    fn test_fullzip_fixed_rejects_non_byte_aligned_values() {
+        let fixed = FixedWidthDataBlock {
+            data: LanceBuffer::from(vec![0_u8]),
+            bits_per_value: 1,
+            num_values: 8,
+            block_info: BlockInfo::new(),
+        };
+        let repdef = build_control_word_iterator(None, 0, None, 0, u16::MAX, 8);
+
+        let Err(err) = PrimitiveStructuralEncoder::serialize_full_zip_fixed(fixed, repdef, 8)
+        else {
+            panic!("expected full-zip to reject 1-bit fixed-width values");
+        };
+        assert!(
+            err.to_string().contains("byte aligned"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

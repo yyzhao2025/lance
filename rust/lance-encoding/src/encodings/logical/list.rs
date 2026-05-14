@@ -262,6 +262,87 @@ mod tests {
         DataType::LargeList(Arc::new(Field::new("item", inner_type, true)))
     }
 
+    async fn encode_v22_pages(array: ArrayRef) -> Vec<crate::encoder::EncodedPage> {
+        let arrow_field = Field::new("", array.data_type().clone(), true);
+        let lance_field = lance_core::datatypes::Field::try_from(&arrow_field).unwrap();
+        let encoding_strategy = crate::encoder::default_encoding_strategy(LanceFileVersion::V2_2);
+        let mut column_index_seq = crate::encoder::ColumnIndexSequence::default();
+        let encoding_options = crate::encoder::EncodingOptions {
+            version: LanceFileVersion::V2_2,
+            ..Default::default()
+        };
+        let mut encoder = encoding_strategy
+            .create_field_encoder(
+                encoding_strategy.as_ref(),
+                &lance_field,
+                &mut column_index_seq,
+                &encoding_options,
+            )
+            .unwrap();
+        let mut external_buffers =
+            crate::encoder::OutOfLineBuffers::new(0, crate::encoder::MIN_PAGE_BUFFER_ALIGNMENT);
+        let num_rows = array.len() as u64;
+        let mut pages = Vec::new();
+        for task in encoder
+            .maybe_encode(
+                array,
+                &mut external_buffers,
+                crate::repdef::RepDefBuilder::default(),
+                0,
+                num_rows,
+            )
+            .unwrap()
+        {
+            pages.push(task.await.unwrap());
+        }
+        for task in encoder.flush(&mut external_buffers).unwrap() {
+            pages.push(task.await.unwrap());
+        }
+        pages
+    }
+
+    fn assert_sparse_boolean_layout(
+        pages: &[crate::encoder::EncodedPage],
+        expect_structural_only_page: bool,
+    ) {
+        let mut miniblock_pages = 0;
+        let mut fullzip_pages = 0;
+        let mut structural_only_pages = 0;
+
+        for page in pages {
+            let crate::decoder::PageEncoding::Structural(layout) = &page.description else {
+                continue;
+            };
+            match layout.layout.as_ref().unwrap() {
+                crate::format::pb21::page_layout::Layout::MiniBlockLayout(_) => {
+                    miniblock_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::FullZipLayout(_) => {
+                    fullzip_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::ConstantLayout(_) => {
+                    structural_only_pages += 1;
+                }
+                crate::format::pb21::page_layout::Layout::BlobLayout(_) => {}
+            }
+        }
+
+        assert!(
+            miniblock_pages > 0,
+            "expected sparse boolean values to remain on mini-block pages"
+        );
+        assert_eq!(
+            fullzip_pages, 0,
+            "sparse boolean list pages should not fall back to full-zip"
+        );
+        if expect_structural_only_page {
+            assert!(
+                structural_only_pages > 0,
+                "expected at least one structural-only page"
+            );
+        }
+    }
+
     #[rstest]
     #[test_log::test(tokio::test)]
     async fn test_list(
@@ -983,8 +1064,10 @@ mod tests {
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, (step / 2) as u64, num_rows as u64 - 1])
             .with_max_file_version(LanceFileVersion::V2_2);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
-            .await;
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_sparse_boolean_layout(&pages, false);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 
     #[test_log::test(tokio::test)]
@@ -1017,7 +1100,46 @@ mod tests {
             .with_range(0..num_rows as u64)
             .with_indices(vec![0, empty_prefix_rows as u64, num_rows as u64 - 1])
             .with_max_file_version(LanceFileVersion::V2_2);
-        check_round_trip_encoding_of_data(vec![Arc::new(list_array)], &test_cases, HashMap::new())
-            .await;
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_sparse_boolean_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_sparse_boolean_list_with_long_null_prefix() {
+        let null_prefix_rows = 70_000usize;
+        let trailing_empty_rows = 9usize;
+        let booleans_per_list = 8usize;
+        let num_rows = null_prefix_rows + 1 + trailing_empty_rows;
+
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.extend(std::iter::repeat_n(0i32, null_prefix_rows + 1));
+        let values = (0..booleans_per_list)
+            .map(|idx| idx % 2 == 0)
+            .collect::<Vec<_>>();
+        offsets.push(values.len() as i32);
+        offsets.extend(std::iter::repeat_n(
+            values.len() as i32,
+            trailing_empty_rows,
+        ));
+        let validity = BooleanBuffer::from_iter((0..num_rows).map(|row| row >= null_prefix_rows));
+
+        let items = BooleanArray::from(values);
+        let list_array = ListArray::new(
+            Arc::new(Field::new("item", DataType::Boolean, true)),
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            Arc::new(items),
+            Some(NullBuffer::new(validity)),
+        );
+
+        let test_cases = TestCases::default()
+            .with_range(0..num_rows as u64)
+            .with_indices(vec![0, null_prefix_rows as u64, num_rows as u64 - 1])
+            .with_max_file_version(LanceFileVersion::V2_2);
+        let list_array = Arc::new(list_array) as ArrayRef;
+        let pages = encode_v22_pages(list_array.clone()).await;
+        assert_sparse_boolean_layout(&pages, true);
+        check_round_trip_encoding_of_data(vec![list_array], &test_cases, HashMap::new()).await;
     }
 }

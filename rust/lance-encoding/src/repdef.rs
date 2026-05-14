@@ -108,6 +108,7 @@
 
 use std::{
     iter::{Copied, Zip},
+    ops::Range,
     sync::Arc,
 };
 
@@ -255,6 +256,15 @@ pub struct SerializedRepDefs {
     pub max_visible_level: Option<u16>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RepDefRowSlice {
+    pub(crate) row_start: u64,
+    pub(crate) num_rows: u64,
+    pub(crate) level_range: Range<usize>,
+    pub(crate) value_start: u64,
+    pub(crate) num_values: u64,
+}
+
 impl SerializedRepDefs {
     pub fn new(
         repetition_levels: Option<LevelBuffer>,
@@ -297,6 +307,186 @@ impl SerializedRepDefs {
         self.definition_levels
             .as_ref()
             .map(|def| RepDefSlicer::new(self, def.clone()))
+    }
+
+    /// Returns the rep/def and value ranges for each top-level row.
+    ///
+    /// This is only available for structures with repetition and definition
+    /// levels.  Fixed-size/non-repeated values do not need structural page
+    /// planning and return `Ok(None)`.
+    pub(crate) fn top_level_row_slices(
+        &self,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<Option<Vec<RepDefRowSlice>>> {
+        let Some(max_visible_level) = self.max_visible_level else {
+            return Ok(None);
+        };
+        let Some(rep) = self.repetition_levels.as_ref() else {
+            return Ok(None);
+        };
+        let Some(def) = self.definition_levels.as_ref() else {
+            return Ok(None);
+        };
+
+        if rep.len() != def.len() {
+            return Err(Error::internal(format!(
+                "Cannot plan structural page splits with mismatched rep/def levels: rep={}, def={}",
+                rep.len(),
+                def.len()
+            )));
+        }
+
+        let max_rep = self
+            .def_meaning
+            .iter()
+            .filter(|level| level.is_list())
+            .count() as u16;
+        if max_rep == 0 {
+            return Ok(None);
+        }
+
+        let expected_rows = usize::try_from(num_rows).map_err(|_| {
+            Error::internal(format!(
+                "Cannot plan structural page splits for {} rows on this platform",
+                num_rows
+            ))
+        })?;
+
+        let mut row_starts = Vec::with_capacity(expected_rows + 1);
+        for (idx, rep_level) in rep.iter().enumerate() {
+            if *rep_level == max_rep {
+                row_starts.push(idx);
+            }
+        }
+        if row_starts.len() != expected_rows {
+            return Err(Error::internal(format!(
+                "Cannot plan structural page splits: expected {} top-level row starts, found {}",
+                expected_rows,
+                row_starts.len()
+            )));
+        }
+        row_starts.push(rep.len());
+
+        let mut value_start = 0u64;
+        let mut slices = Vec::with_capacity(expected_rows);
+        for row_idx in 0..expected_rows {
+            let level_range = row_starts[row_idx]..row_starts[row_idx + 1];
+            let num_row_values = def[level_range.clone()]
+                .iter()
+                .filter(|def_level| **def_level <= max_visible_level)
+                .count() as u64;
+            slices.push(RepDefRowSlice {
+                row_start: row_idx as u64,
+                num_rows: 1,
+                level_range,
+                value_start,
+                num_values: num_row_values,
+            });
+            value_start += num_row_values;
+        }
+
+        if value_start != num_values {
+            return Err(Error::internal(format!(
+                "Cannot plan structural page splits: counted {} visible values, expected {}",
+                value_start, num_values
+            )));
+        }
+
+        Ok(Some(slices))
+    }
+
+    pub(crate) fn has_top_level_zero_value_run_over(
+        &self,
+        max_levels: u64,
+        num_rows: u64,
+        num_values: u64,
+    ) -> Result<bool> {
+        let Some(max_visible_level) = self.max_visible_level else {
+            return Ok(false);
+        };
+        let Some(rep) = self.repetition_levels.as_ref() else {
+            return Ok(false);
+        };
+        let Some(def) = self.definition_levels.as_ref() else {
+            return Ok(false);
+        };
+
+        if rep.len() != def.len() {
+            return Err(Error::internal(format!(
+                "Cannot inspect structural runs with mismatched rep/def levels: rep={}, def={}",
+                rep.len(),
+                def.len()
+            )));
+        }
+
+        let max_rep = self
+            .def_meaning
+            .iter()
+            .filter(|level| level.is_list())
+            .count() as u16;
+        if max_rep == 0 {
+            return Ok(false);
+        }
+
+        let expected_rows = usize::try_from(num_rows).map_err(|_| {
+            Error::internal(format!(
+                "Cannot inspect structural runs for {} rows on this platform",
+                num_rows
+            ))
+        })?;
+
+        let mut row_start = None;
+        let mut rows_seen = 0usize;
+        let mut total_visible_values = 0u64;
+        let mut zero_value_run_levels = 0u64;
+
+        let mut inspect_row = |level_range: Range<usize>| {
+            let num_row_values = def[level_range.clone()]
+                .iter()
+                .filter(|def_level| **def_level <= max_visible_level)
+                .count() as u64;
+            total_visible_values += num_row_values;
+            if num_row_values == 0 {
+                zero_value_run_levels += (level_range.end - level_range.start) as u64;
+                zero_value_run_levels > max_levels
+            } else {
+                zero_value_run_levels = 0;
+                false
+            }
+        };
+
+        for (idx, rep_level) in rep.iter().enumerate() {
+            if *rep_level == max_rep {
+                if let Some(start) = row_start
+                    && inspect_row(start..idx)
+                {
+                    return Ok(true);
+                }
+                row_start = Some(idx);
+                rows_seen += 1;
+            }
+        }
+        if let Some(start) = row_start
+            && inspect_row(start..rep.len())
+        {
+            return Ok(true);
+        }
+
+        if rows_seen != expected_rows {
+            return Err(Error::internal(format!(
+                "Cannot inspect structural runs: expected {} top-level row starts, found {}",
+                expected_rows, rows_seen
+            )));
+        }
+        if total_visible_values != num_values {
+            return Err(Error::internal(format!(
+                "Cannot inspect structural runs: counted {} visible values, expected {}",
+                total_visible_values, num_values
+            )));
+        }
+
+        Ok(false)
     }
 }
 
