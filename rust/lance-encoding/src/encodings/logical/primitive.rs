@@ -5335,103 +5335,49 @@ impl PrimitiveStructuralEncoder {
         let mut current_page_num_levels = 0u64;
         let mut current_page_has_structural_overhead = false;
 
-        let finish_row = |row_level_end: usize,
-                          splits: &mut Vec<StructuralPageSplit>,
-                          counted_rows: &mut u64,
-                          counted_values: &mut u64,
-                          saw_structural_overhead: &mut bool,
-                          unsplittable_over_budget: &mut Option<u64>,
-                          current_row_level_start: &mut usize,
-                          current_page_row_start: &mut u64,
-                          current_page_num_rows: &mut u64,
-                          current_page_level_start: &mut usize,
-                          current_page_level_end: &mut usize,
-                          current_page_value_start: &mut u64,
-                          current_page_num_values: &mut u64,
-                          current_page_num_levels: &mut u64,
-                          current_page_has_structural_overhead: &mut bool|
-         -> Result<()> {
-            let row_level_range = *current_row_level_start..row_level_end;
-            let row_num_levels = (row_level_end - *current_row_level_start) as u64;
+        for row_level_end in row_start_positions.chain(std::iter::once(rep.len())) {
+            let row_level_range = current_row_level_start..row_level_end;
+            let row_num_levels = (row_level_end - current_row_level_start) as u64;
             let row_num_values = def[row_level_range]
                 .iter()
                 .filter(|def_level| **def_level <= max_visible_level)
                 .count() as u64;
             let row_has_structural_overhead = row_num_levels > row_num_values;
-            *saw_structural_overhead |= row_has_structural_overhead;
+            saw_structural_overhead |= row_has_structural_overhead;
 
             if row_has_structural_overhead && row_num_levels > max_levels {
-                *unsplittable_over_budget = Some(row_num_levels);
+                unsplittable_over_budget = Some(row_num_levels);
             }
 
-            if *current_page_num_rows > 0
-                && (*current_page_has_structural_overhead || row_has_structural_overhead)
-                && *current_page_num_levels + row_num_levels > max_levels
+            if current_page_num_rows > 0
+                && (current_page_has_structural_overhead || row_has_structural_overhead)
+                && current_page_num_levels + row_num_levels > max_levels
             {
                 splits.push(StructuralPageSplit {
-                    row_start: *current_page_row_start,
-                    num_rows: *current_page_num_rows,
-                    level_range: *current_page_level_start..*current_page_level_end,
-                    value_start: *current_page_value_start,
-                    num_values: *current_page_num_values,
+                    row_start: current_page_row_start,
+                    num_rows: current_page_num_rows,
+                    level_range: current_page_level_start..current_page_level_end,
+                    value_start: current_page_value_start,
+                    num_values: current_page_num_values,
                 });
-                *current_page_row_start = *counted_rows;
-                *current_page_num_rows = 0;
-                *current_page_level_start = *current_row_level_start;
-                *current_page_level_end = *current_row_level_start;
-                *current_page_value_start = *counted_values;
-                *current_page_num_values = 0;
-                *current_page_num_levels = 0;
-                *current_page_has_structural_overhead = false;
+                current_page_row_start = counted_rows;
+                current_page_num_rows = 0;
+                current_page_level_start = current_row_level_start;
+                current_page_value_start = counted_values;
+                current_page_num_values = 0;
+                current_page_num_levels = 0;
+                current_page_has_structural_overhead = false;
             }
 
-            *current_page_num_rows += 1;
-            *current_page_level_end = row_level_end;
-            *current_page_num_values += row_num_values;
-            *current_page_num_levels += row_num_levels;
-            *current_page_has_structural_overhead |= row_has_structural_overhead;
-            *counted_rows += 1;
-            *counted_values += row_num_values;
-            *current_row_level_start = row_level_end;
-            Ok(())
-        };
-
-        for row_level_start in row_start_positions {
-            finish_row(
-                row_level_start,
-                &mut splits,
-                &mut counted_rows,
-                &mut counted_values,
-                &mut saw_structural_overhead,
-                &mut unsplittable_over_budget,
-                &mut current_row_level_start,
-                &mut current_page_row_start,
-                &mut current_page_num_rows,
-                &mut current_page_level_start,
-                &mut current_page_level_end,
-                &mut current_page_value_start,
-                &mut current_page_num_values,
-                &mut current_page_num_levels,
-                &mut current_page_has_structural_overhead,
-            )?;
+            current_page_num_rows += 1;
+            current_page_level_end = row_level_end;
+            current_page_num_values += row_num_values;
+            current_page_num_levels += row_num_levels;
+            current_page_has_structural_overhead |= row_has_structural_overhead;
+            counted_rows += 1;
+            counted_values += row_num_values;
+            current_row_level_start = row_level_end;
         }
-        finish_row(
-            rep.len(),
-            &mut splits,
-            &mut counted_rows,
-            &mut counted_values,
-            &mut saw_structural_overhead,
-            &mut unsplittable_over_budget,
-            &mut current_row_level_start,
-            &mut current_page_row_start,
-            &mut current_page_num_rows,
-            &mut current_page_level_start,
-            &mut current_page_level_end,
-            &mut current_page_value_start,
-            &mut current_page_num_values,
-            &mut current_page_num_levels,
-            &mut current_page_has_structural_overhead,
-        )?;
 
         if counted_rows != num_rows {
             return Err(Error::internal(format!(
