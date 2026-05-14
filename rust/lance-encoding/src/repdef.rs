@@ -150,8 +150,11 @@ pub(crate) enum StructuralPagePlan {
 
 #[derive(Debug)]
 struct StructuralRowSummary {
+    /// First rep/def level index that belongs to this top-level row.
     level_start: usize,
+    /// Exclusive end of the rep/def level range for this top-level row.
     level_end: usize,
+    /// Number of visible leaf values in this top-level row.
     num_values: u64,
 }
 
@@ -161,11 +164,14 @@ struct StructuralRowSummary {
 /// page decisions without rescanning the serialized level buffers.
 #[derive(Debug)]
 pub(crate) struct StructuralRepDefSummary {
+    /// Number of bits needed to store one rep/def pair for this page.
     bits_per_level: Option<u64>,
+    /// Per-row structural spans, present only when the page has list overhead.
     rows: Option<Vec<StructuralRowSummary>>,
 }
 
 impl StructuralRepDefSummary {
+    /// Creates a summary for pages without serialized rep/def buffers.
     fn empty() -> Self {
         Self {
             bits_per_level: None,
@@ -173,10 +179,16 @@ impl StructuralRepDefSummary {
         }
     }
 
+    /// Returns the encoded width of one rep/def pair, if any levels are present.
     pub(crate) fn bits_per_level(&self) -> Option<u64> {
         self.bits_per_level
     }
 
+    /// Plans structural page splits using a caller-provided per-page level budget.
+    ///
+    /// The summary itself is encoding-agnostic.  The primitive encoder translates
+    /// miniblock chunk limits into `max_levels_per_page` and owns the decision to
+    /// use miniblock, split pages, or fall back to another structural encoding.
     pub(crate) fn plan_splits(
         &self,
         max_levels_per_page: u64,
