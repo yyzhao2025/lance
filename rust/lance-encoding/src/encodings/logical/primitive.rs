@@ -3764,39 +3764,67 @@ struct DictEncodingBudget {
     max_encoded_size: usize,
 }
 
+// A primitive page after optional structural splitting.
 struct PrimitivePageData {
+    // Arrow leaf arrays that contain this page's visible values.
     arrays: Vec<ArrayRef>,
+    // Repetition / definition levels aligned to this page.
     repdef: SerializedRepDefs,
+    // Top-level row number of the first row in this page.
     row_number: u64,
+    // Number of top-level rows in this page.
     num_rows: u64,
+    // Present when one top-level row is too large for one miniblock rep/def chunk.
     unsplittable_miniblock_levels: Option<u64>,
 }
 
+// A contiguous top-level-row range that can be encoded as one structural page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StructuralPageSplit {
+    // Top-level row offset, relative to the original unsplit page.
     row_start: u64,
+    // Number of top-level rows in this split.
     num_rows: u64,
+    // Rep/def level range, relative to the original unsplit page.
     level_range: Range<usize>,
+    // Visible value offset, relative to the original unsplit page.
     value_start: u64,
+    // Number of visible values in this split.
     num_values: u64,
 }
 
+// Planner result for miniblock structural budget handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StructuralPagePlan {
+    // The original page can be encoded as-is.
     Fits,
+    // The original page should be split on top-level row boundaries.
     Split(Vec<StructuralPageSplit>),
+    // One top-level row is larger than the miniblock rep/def budget.
     UnsplittableOverBudget(u64),
 }
 
+// Immutable encoder state shared by per-page encode tasks.
+//
+// Cloning this only clones Arc-backed configuration and field metadata.  Page data
+// stays in PrimitivePageData and is moved into exactly one task.
 #[derive(Clone)]
 struct PrimitiveEncodeContext {
+    // Column being encoded.
     column_idx: u32,
+    // Logical field metadata for compression/layout selection.
     field: Field,
+    // Compression strategy shared across pages.
     compression_strategy: Arc<dyn CompressionStrategy>,
+    // Field-level encoding metadata such as structural encoding overrides.
     encoding_metadata: Arc<HashMap<String, String>>,
+    // Whether miniblock chunks may use the v2.2 large-chunk metadata.
     support_large_chunk: bool,
+    // Lance file version selected by the writer.
     version: LanceFileVersion,
+    // True when the only rep/def information is simple nullable validity.
     is_simple_validity: bool,
+    // True when the field has any non-empty rep/def information.
     has_repdef_info: bool,
 }
 
@@ -3890,57 +3918,6 @@ impl PrimitiveStructuralEncoder {
             return user_requested.to_lowercase() == STRUCTURAL_ENCODING_FULLZIP;
         }
         true
-    }
-
-    fn fullzip_value_layout_error(data_block: &DataBlock) -> Option<String> {
-        match data_block {
-            DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
-                Some(format!(
-                    "Full-zip fixed-width values must be byte aligned, got {} bits per value",
-                    fixed.bits_per_value
-                ))
-            }
-            DataBlock::VariableWidth(variable) if !variable.bits_per_offset.is_multiple_of(8) => {
-                Some(format!(
-                    "Full-zip variable-width offsets must be byte aligned, got {} bits per offset",
-                    variable.bits_per_offset
-                ))
-            }
-            DataBlock::VariableWidth(variable)
-                if variable.bits_per_offset != 32 && variable.bits_per_offset != 64 =>
-            {
-                Some(format!(
-                    "Full-zip variable-width offsets must be 32 or 64 bits, got {} bits",
-                    variable.bits_per_offset
-                ))
-            }
-            DataBlock::Struct(struct_data_block)
-                if !struct_data_block.has_variable_width_child() =>
-            {
-                Some(
-                    "Full-zip packed struct requires at least one variable-width child".to_string(),
-                )
-            }
-            DataBlock::Dictionary(_) => {
-                Some("Full-zip does not encode dictionary data blocks directly".to_string())
-            }
-            DataBlock::FixedSizeList(fsl) => match fsl.clone().try_into_flat() {
-                Some(flat) if flat.bits_per_value.is_multiple_of(8) => None,
-                Some(flat) => Some(format!(
-                    "Full-zip fixed-size-list values must be byte aligned after flattening, got {} bits per value",
-                    flat.bits_per_value
-                )),
-                None => Some(
-                    "Full-zip fixed-size-list capability requires a flat fixed-width child"
-                        .to_string(),
-                ),
-            },
-            DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_) | DataBlock::Struct(_) => None,
-            other => Some(format!(
-                "Full-zip does not support value block type {}",
-                other.name()
-            )),
-        }
     }
 
     // Converts value data, repetition levels, and definition levels into a single
@@ -5641,7 +5618,59 @@ impl PrimitiveStructuralEncoder {
             let requested_encoding = encoding_metadata
                 .get(STRUCTURAL_ENCODING_META_KEY)
                 .map(|requested| requested.to_lowercase());
-            let fullzip_error = Self::fullzip_value_layout_error(&data_block);
+            let fullzip_error = match &data_block {
+                DataBlock::FixedWidth(fixed) if !fixed.bits_per_value.is_multiple_of(8) => {
+                    Some(format!(
+                        "Full-zip fixed-width values must be byte aligned, got {} bits per value",
+                        fixed.bits_per_value
+                    ))
+                }
+                DataBlock::VariableWidth(variable)
+                    if !variable.bits_per_offset.is_multiple_of(8) =>
+                {
+                    Some(format!(
+                        "Full-zip variable-width offsets must be byte aligned, got {} bits per offset",
+                        variable.bits_per_offset
+                    ))
+                }
+                DataBlock::VariableWidth(variable)
+                    if variable.bits_per_offset != 32 && variable.bits_per_offset != 64 =>
+                {
+                    Some(format!(
+                        "Full-zip variable-width offsets must be 32 or 64 bits, got {} bits",
+                        variable.bits_per_offset
+                    ))
+                }
+                DataBlock::Struct(struct_data_block)
+                    if !struct_data_block.has_variable_width_child() =>
+                {
+                    Some(
+                        "Full-zip packed struct requires at least one variable-width child"
+                            .to_string(),
+                    )
+                }
+                DataBlock::Dictionary(_) => {
+                    Some("Full-zip does not encode dictionary data blocks directly".to_string())
+                }
+                DataBlock::FixedSizeList(fsl) => match fsl.clone().try_into_flat() {
+                    Some(flat) if flat.bits_per_value.is_multiple_of(8) => None,
+                    Some(flat) => Some(format!(
+                        "Full-zip fixed-size-list values must be byte aligned after flattening, got {} bits per value",
+                        flat.bits_per_value
+                    )),
+                    None => Some(
+                        "Full-zip fixed-size-list capability requires a flat fixed-width child"
+                            .to_string(),
+                    ),
+                },
+                DataBlock::FixedWidth(_) | DataBlock::VariableWidth(_) | DataBlock::Struct(_) => {
+                    None
+                }
+                other => Some(format!(
+                    "Full-zip does not support value block type {}",
+                    other.name()
+                )),
+            };
             match requested_encoding.as_deref() {
                 Some(STRUCTURAL_ENCODING_FULLZIP) => {
                     if let Some(reason) = fullzip_error {
