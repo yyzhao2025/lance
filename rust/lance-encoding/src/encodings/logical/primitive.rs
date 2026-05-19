@@ -1378,6 +1378,10 @@ pub struct MiniBlockScheduler {
     // This is set after initialization
     page_meta: Option<Arc<MiniBlockCacheableState>>,
     has_large_chunk: bool,
+    // When present, the per-chunk "Words" metadata buffer has been inlined into the
+    // page layout proto by the writer. `initialize` consumes these bytes directly
+    // instead of issuing an I/O to read buffer_offsets_and_sizes[0].
+    inline_chunk_meta: Option<bytes::Bytes>,
 }
 
 impl MiniBlockScheduler {
@@ -1462,6 +1466,7 @@ impl MiniBlockScheduler {
             def_meaning: def_meaning.into(),
             page_meta: None,
             has_large_chunk: layout.has_large_chunk,
+            inline_chunk_meta: layout.inline_chunk_meta.clone(),
         })
     }
 
@@ -1842,20 +1847,15 @@ impl StructuralPageScheduler for MiniBlockScheduler {
         &'a mut self,
         io: &Arc<dyn EncodingsIo>,
     ) -> BoxFuture<'a, Result<Arc<dyn CachedPageData>>> {
-        // We always need to fetch chunk metadata.  We may also need to fetch a dictionary and
-        // we may also need to fetch the repetition index.  Here, we gather what buffers we
-        // need.
-        let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
+        // The per-chunk metadata may be inlined in the page layout proto (new readers); if so
+        // we skip its I/O. We may still need to fetch a dictionary or repetition index.
         let value_buf_position = self.buffer_offsets_and_sizes[1].0;
-        let mut bufs_needed = 1;
-        if self.dictionary.is_some() {
-            bufs_needed += 1;
+        let inline_meta = self.inline_chunk_meta.clone();
+        let mut required_ranges = Vec::with_capacity(3);
+        if inline_meta.is_none() {
+            let (meta_buf_position, meta_buf_size) = self.buffer_offsets_and_sizes[0];
+            required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
         }
-        if self.repetition_index_depth > 0 {
-            bufs_needed += 1;
-        }
-        let mut required_ranges = Vec::with_capacity(bufs_needed);
-        required_ranges.push(meta_buf_position..meta_buf_position + meta_buf_size);
         if let Some(ref dictionary) = self.dictionary {
             required_ranges.push(
                 dictionary.dictionary_buf_position_and_size.0
@@ -1867,11 +1867,19 @@ impl StructuralPageScheduler for MiniBlockScheduler {
             let (rep_index_pos, rep_index_size) = self.buffer_offsets_and_sizes.last().unwrap();
             required_ranges.push(*rep_index_pos..*rep_index_pos + *rep_index_size);
         }
-        let io_req = io.submit_request(required_ranges, 0);
+        // When everything we need is inlined, avoid the round-trip entirely.
+        let io_req = (!required_ranges.is_empty()).then(|| io.submit_request(required_ranges, 0));
 
         async move {
-            let mut buffers = io_req.await?.into_iter().fuse();
-            let meta_bytes = buffers.next().unwrap();
+            let fetched = match io_req {
+                Some(fut) => fut.await?,
+                None => Vec::new(),
+            };
+            let mut buffers = fetched.into_iter().fuse();
+            let meta_bytes = match inline_meta {
+                Some(b) => b,
+                None => buffers.next().unwrap(),
+            };
             let dictionary_bytes = self.dictionary.as_ref().and_then(|_| buffers.next());
             let rep_index_bytes = buffers.next();
 
@@ -4616,6 +4624,11 @@ impl PrimitiveStructuralEncoder {
         let serialized =
             Self::serialize_miniblocks(compressed_data, rep_data, def_data, support_large_chunk)?;
 
+        // Copy the per-chunk "Words" metadata so we can also inline it into the page layout
+        // proto. New readers can then skip the per-column metadata I/O at initialize time;
+        // old readers still consume the on-disk copy at buffer_offsets_and_sizes[0].
+        let inline_chunk_meta = serialized.metadata.as_ref().to_vec();
+
         // Metadata, Data, Dictionary, (maybe) Repetition Index
         let mut data = Vec::with_capacity(4);
         data.push(serialized.metadata);
@@ -4644,6 +4657,7 @@ impl PrimitiveStructuralEncoder {
                 &repdef.def_meaning,
                 num_items,
                 support_large_chunk,
+                Some(inline_chunk_meta),
             );
             Ok(EncodedPage {
                 num_rows,
@@ -4663,6 +4677,7 @@ impl PrimitiveStructuralEncoder {
                 &repdef.def_meaning,
                 num_items,
                 support_large_chunk,
+                Some(inline_chunk_meta),
             );
 
             if let Some(rep_index) = rep_index {
@@ -6356,6 +6371,168 @@ mod tests {
         );
     }
 
+    /// Shared `RecordingScheduler` used by mini-block initialize tests to assert on
+    /// the exact set of byte ranges fetched (or that none are fetched at all).
+    #[derive(Debug, Clone)]
+    struct RecordingScheduler {
+        data: bytes::Bytes,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<Vec<std::ops::Range<u64>>>>>,
+    }
+
+    impl RecordingScheduler {
+        fn new(data: bytes::Bytes) -> Self {
+            Self {
+                data,
+                requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn requests(&self) -> Vec<Vec<std::ops::Range<u64>>> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl crate::EncodingsIo for RecordingScheduler {
+        fn submit_request(
+            &self,
+            ranges: Vec<std::ops::Range<u64>>,
+            _priority: u64,
+        ) -> futures::future::BoxFuture<'static, crate::Result<Vec<bytes::Bytes>>> {
+            use futures::FutureExt;
+            self.requests.lock().unwrap().push(ranges.clone());
+            let data = ranges
+                .into_iter()
+                .map(|range| self.data.slice(range.start as usize..range.end as usize))
+                .collect::<Vec<_>>();
+            std::future::ready(Ok(data)).boxed()
+        }
+    }
+
+    /// Single-chunk page metadata for `items_in_page` items: a u16 word of `0`
+    /// (log_num_values=0, divided_bytes=0). The reader uses `items_in_page` for
+    /// the final chunk's value count when `log_num_values == 0`.
+    fn single_chunk_meta_bytes() -> Vec<u8> {
+        vec![0u8, 0u8]
+    }
+
+    fn minimal_miniblock_layout() -> pb21::MiniBlockLayout {
+        pb21::MiniBlockLayout {
+            rep_compression: None,
+            def_compression: None,
+            value_compression: Some(ProtobufUtils21::flat(32, None)),
+            dictionary: None,
+            num_dictionary_items: 0,
+            layers: vec![pb21::RepDefLayer::RepdefAllValidItem as i32],
+            num_buffers: 1,
+            repetition_index_depth: 0,
+            num_items: 100,
+            has_large_chunk: false,
+            inline_chunk_meta: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_miniblock_initialize_skips_io_when_meta_inlined() {
+        // Inline chunk metadata + no dictionary + no rep index → no I/O at init.
+        let mut layout = minimal_miniblock_layout();
+        layout.inline_chunk_meta = Some(bytes::Bytes::from(single_chunk_meta_bytes()));
+
+        // buffer_offsets_and_sizes: [meta(unused), data(unused)]
+        let buffer_offsets_and_sizes = vec![(0, 0), (0, 0)];
+        let mut scheduler = super::MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            /*priority=*/ 0,
+            /*items_in_page=*/ 100,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+
+        let io = std::sync::Arc::new(RecordingScheduler::new(bytes::Bytes::new()));
+        let io_dyn: std::sync::Arc<dyn crate::EncodingsIo> = io.clone();
+        scheduler.initialize(&io_dyn).await.unwrap();
+
+        assert!(
+            io.requests().is_empty(),
+            "MiniBlock initialize should not issue I/O when chunk metadata is inlined"
+        );
+        assert!(scheduler.page_meta.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_miniblock_initialize_reads_meta_when_not_inlined() {
+        // Backwards-compat path: no inline metadata → fetch the metadata buffer
+        // from disk as before.
+        let layout = minimal_miniblock_layout();
+        let meta_bytes = single_chunk_meta_bytes();
+        let meta_pos: u64 = 100;
+        let meta_size = meta_bytes.len() as u64;
+
+        // Pad a backing buffer so that the recorded slice at `meta_pos` returns our bytes.
+        let mut backing = vec![0u8; (meta_pos + meta_size) as usize];
+        backing[meta_pos as usize..(meta_pos + meta_size) as usize].copy_from_slice(&meta_bytes);
+
+        let buffer_offsets_and_sizes = vec![(meta_pos, meta_size), (0, 0)];
+        let mut scheduler = super::MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            /*priority=*/ 0,
+            /*items_in_page=*/ 100,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+
+        let io = std::sync::Arc::new(RecordingScheduler::new(bytes::Bytes::from(backing)));
+        let io_dyn: std::sync::Arc<dyn crate::EncodingsIo> = io.clone();
+        scheduler.initialize(&io_dyn).await.unwrap();
+
+        let requests = io.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "Expected exactly one I/O request for the metadata buffer"
+        );
+        assert_eq!(requests[0], vec![meta_pos..meta_pos + meta_size]);
+    }
+
+    #[tokio::test]
+    async fn test_miniblock_initialize_fetches_only_dictionary_when_meta_inlined() {
+        // Inline metadata + dictionary present → exactly one I/O, covering the
+        // dictionary range (not the metadata range).
+        let mut layout = minimal_miniblock_layout();
+        layout.inline_chunk_meta = Some(bytes::Bytes::from(single_chunk_meta_bytes()));
+        // Use Flat(64) dictionary so the decompressor accepts 16 bytes (alignment=16,
+        // 2 dictionary items at 8 bytes each). Zero-filled bytes decode to two zero u64s.
+        layout.dictionary = Some(ProtobufUtils21::flat(64, None));
+        layout.num_dictionary_items = 2;
+
+        let dict_pos: u64 = 256;
+        let dict_size: u64 = 16;
+        // buffer_offsets_and_sizes: [meta(unused), data(unused), dictionary]
+        let buffer_offsets_and_sizes = vec![(0, 0), (0, 0), (dict_pos, dict_size)];
+        let mut scheduler = super::MiniBlockScheduler::try_new(
+            &buffer_offsets_and_sizes,
+            /*priority=*/ 0,
+            /*items_in_page=*/ 100,
+            &layout,
+            &DefaultDecompressionStrategy::default(),
+        )
+        .unwrap();
+
+        let backing = vec![0u8; (dict_pos + dict_size) as usize];
+        let io = std::sync::Arc::new(RecordingScheduler::new(bytes::Bytes::from(backing)));
+        let io_dyn: std::sync::Arc<dyn crate::EncodingsIo> = io.clone();
+        scheduler.initialize(&io_dyn).await.unwrap();
+
+        let requests = io.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "Expected exactly one I/O request (dictionary only) when meta is inlined"
+        );
+        assert_eq!(requests[0], vec![dict_pos..dict_pos + dict_size]);
+    }
+
     #[tokio::test]
     async fn test_fullzip_read_source_slices_prefetched_page() {
         let page_start = 200_u64;
@@ -7027,6 +7204,7 @@ mod tests {
             repetition_index_depth: 0,
             num_items: rows,
             has_large_chunk: false,
+            inline_chunk_meta: None,
         };
 
         let buffer_offsets_and_sizes = vec![(0, 0), (0, 0), (0, 0)];
@@ -7222,6 +7400,34 @@ mod tests {
             pages.push(task.await.unwrap());
         }
         pages.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_miniblock_layout_inlines_chunk_meta_matching_page_buffer() {
+        use crate::format::pb21::page_layout::Layout;
+
+        // A non-constant int column big enough to be encoded as mini-block.
+        let arr: ArrayRef = Arc::new(arrow_array::Int32Array::from_iter_values(0..2048));
+        let field = arrow_schema::Field::new("c", DataType::Int32, false);
+        let page = encode_first_page(field, arr, LanceFileVersion::V2_2).await;
+
+        let PageEncoding::Structural(layout) = &page.description else {
+            panic!("Expected structural encoding");
+        };
+        let Layout::MiniBlockLayout(mini_block) = layout.layout.as_ref().unwrap() else {
+            panic!("Expected mini-block layout");
+        };
+
+        let inline = mini_block
+            .inline_chunk_meta
+            .as_ref()
+            .expect("inline_chunk_meta should be populated by the writer");
+        // page.data[0] is the on-disk metadata buffer; the inline copy must match byte-for-byte.
+        assert_eq!(
+            inline.as_ref(),
+            page.data[0].as_ref(),
+            "inline_chunk_meta must equal the on-disk Words buffer"
+        );
     }
 
     #[tokio::test]

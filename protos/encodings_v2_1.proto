@@ -115,6 +115,20 @@ message MiniBlockLayout {
 
   // Since Lance 2.2, miniblocks have larger chunk sizes (>= 64KB)
   bool has_large_chunk = 10;
+
+  // Inlined per-chunk "Words" metadata buffer.
+  //
+  // Optional. When present, contains a verbatim copy of the bytes also written
+  // at buffer_offsets_and_sizes[0] for this page. Readers that understand this
+  // field MAY skip the I/O fetch of that buffer at scheduler init time and
+  // parse the chunk metadata directly from the inline bytes. Readers that do
+  // not recognize this field ignore it and continue to fetch the buffer from
+  // disk; the page on-disk layout is unchanged.
+  //
+  // Each entry is a u16 (Lance 2.1) or u32 (Lance 2.2+, when has_large_chunk
+  // is true) word matching the on-disk encoding produced by
+  // PrimitiveStructuralEncoder::serialize_miniblocks.
+  optional bytes inline_chunk_meta = 11;
 }
 
 // A layout used for pages where the data is large
