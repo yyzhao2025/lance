@@ -807,16 +807,19 @@ impl SerializerContext {
         num_rows: u64,
         num_values: u64,
     ) -> Result<StructuralPagePlan> {
+        // Extremely sparse lists can have many rep/def levels for very few
+        // visible leaf values.  If this ratio becomes too skewed then a
+        // miniblock structural chunk can exceed its packed rep/def metadata
+        // budget even though the value buffers are small.  We detect that case
+        // while normalizing special def levels and split the structural page on
+        // top-level row boundaries so each emitted page stays within the
+        // miniblock structural budget.
         if self.def_levels.is_empty() {
             return Ok(StructuralPagePlan::Fits);
         }
 
         if self.rep_levels.is_empty() {
-            for def in self.def_levels.iter_mut() {
-                if *def > SPECIAL_THRESHOLD {
-                    *def -= SPECIAL_THRESHOLD;
-                }
-            }
+            self.normalize_specials();
             return Ok(StructuralPagePlan::Fits);
         }
 
@@ -829,20 +832,12 @@ impl SerializerContext {
         }
 
         let Some(max_levels_per_page) = max_levels_per_page else {
-            for def in self.def_levels.iter_mut() {
-                if *def > SPECIAL_THRESHOLD {
-                    *def -= SPECIAL_THRESHOLD;
-                }
-            }
+            self.normalize_specials();
             return Ok(StructuralPagePlan::Fits);
         };
 
         if num_values == 0 {
-            for def in self.def_levels.iter_mut() {
-                if *def > SPECIAL_THRESHOLD {
-                    *def -= SPECIAL_THRESHOLD;
-                }
-            }
+            self.normalize_specials();
             return Ok(StructuralPagePlan::Fits);
         }
 
@@ -851,11 +846,7 @@ impl SerializerContext {
         let should_plan = !self.has_fsl && max_schema_rep > 0 && max_visible_level.is_some();
 
         if !should_plan {
-            for def in self.def_levels.iter_mut() {
-                if *def > SPECIAL_THRESHOLD {
-                    *def -= SPECIAL_THRESHOLD;
-                }
-            }
+            self.normalize_specials();
             return Ok(StructuralPagePlan::Fits);
         }
 
