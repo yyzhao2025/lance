@@ -436,18 +436,27 @@ def test_has_stable_row_ids_property(tmp_path: Path):
     assert lance.dataset(non_stable_path).has_stable_row_ids is False
 
 
+def _list_manifests(versions_dir):
+    # Ignore the version hint file, which is not a manifest.
+    return [
+        name
+        for name in os.listdir(versions_dir)
+        if not name.startswith("latest_version_hint")
+    ]
+
+
 def test_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=True
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
 
 def test_default_v2_manifest_paths(tmp_path: Path):
     lance.write_dataset(pa.table({"a": range(100)}), tmp_path)
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
@@ -457,12 +466,12 @@ def test_v2_manifest_paths_migration(tmp_path: Path):
     lance.write_dataset(
         pa.table({"a": range(100)}), tmp_path, enable_v2_manifest_paths=False
     )
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert manifest_path == ["1.manifest"]
 
     # Migrate to v2 manifest paths
     lance.dataset(tmp_path).migrate_manifest_paths_v2()
-    manifest_path = os.listdir(tmp_path / "_versions")
+    manifest_path = _list_manifests(tmp_path / "_versions")
     assert len(manifest_path) == 1
     assert re.match(r"\d{20}\.manifest", manifest_path[0])
 
@@ -3079,6 +3088,37 @@ def test_update_dataset(tmp_path: Path):
     )
     assert dataset.to_table(columns=["b", "vec"]).sort_by("b") == expected
     check_update_stats(update_dict, (100,))
+
+
+def test_update_dataset_scanner_after_stable_row_id_update(tmp_path: Path):
+    dataset = lance.write_dataset(
+        pa.table(
+            {
+                "name_1": pa.array(["1", "4", "7"]),
+                "name_2": pa.array(["2", "5", "8"]),
+                "name_3": pa.array(["3", "6", "9"]),
+            }
+        ),
+        tmp_path / "dataset",
+        enable_stable_row_ids=True,
+    )
+
+    update_dict = dataset.update(updates=dict(name_3="'xxxx'"), where="name_1 = '7'")
+    check_update_stats(update_dict, (1,))
+
+    expected = pa.table(
+        {
+            "name_1": pa.array(["1", "4", "7"]),
+            "name_2": pa.array(["2", "5", "8"]),
+            "name_3": pa.array(["3", "6", "xxxx"]),
+        }
+    )
+    actual = dataset.to_table().sort_by("name_1")
+    assert actual == expected
+
+    scanner_table = dataset.scanner(limit=10).to_table().sort_by("name_1")
+    assert scanner_table == expected
+    assert scanner_table == actual
 
 
 def test_update_dataset_all_types(tmp_path: Path):
