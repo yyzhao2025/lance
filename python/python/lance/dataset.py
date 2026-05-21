@@ -3138,6 +3138,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        streaming_sample_rate: Optional[int] = None,
+        streaming_coreset_rate: Optional[int] = None,
+        streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         require_commit: bool = True,
         **kwargs,
@@ -3349,6 +3352,12 @@ class LanceDataset(pa.dataset.Dataset):
                 kwargs["num_partitions"] = num_partitions
             if target_partition_size is not None:
                 kwargs["target_partition_size"] = target_partition_size
+            if streaming_sample_rate is not None:
+                kwargs["streaming_sample_rate"] = streaming_sample_rate
+            if streaming_coreset_rate is not None:
+                kwargs["streaming_coreset_rate"] = streaming_coreset_rate
+            if streaming_refine_passes is not None:
+                kwargs["streaming_refine_passes"] = streaming_refine_passes
 
             if (precomputed_partition_dataset is not None) and (ivf_centroids is None):
                 raise ValueError(
@@ -3510,6 +3519,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        streaming_sample_rate: Optional[int] = None,
+        streaming_coreset_rate: Optional[int] = None,
+        streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         progress_callback: Optional[Callable[[IndexProgress], None]] = None,
         **kwargs,
@@ -3598,6 +3610,19 @@ class LanceDataset(pa.dataset.Dataset):
             The target partition size. If set, the number of partitions will be computed
             based on the target partition size.
             Otherwise, the target partition size will be set by index type.
+        streaming_sample_rate : int, optional
+            If set below ``sample_rate``, IVF kmeans trains incrementally and samples
+            at most ``num_partitions * streaming_sample_rate`` vectors per step. For
+            ``num_partitions > 256``, chunks are compressed into a weighted coreset
+            and final centroids are trained with weighted hierarchical kmeans.
+        streaming_coreset_rate : int, optional
+            If set, controls the final weighted coreset budget independently from
+            ``streaming_sample_rate``. The budget is
+            ``num_partitions * streaming_coreset_rate``.
+        streaming_refine_passes : int, optional
+            Number of extra streaming Lloyd refinement passes to run after streaming
+            coreset training. Each pass loads at most
+            ``num_partitions * streaming_sample_rate`` raw vectors at a time.
         kwargs :
             Parameters passed to the index building process.
 
@@ -3719,6 +3744,9 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_ids=fragment_ids,
             index_uuid=index_uuid,
             target_partition_size=target_partition_size,
+            streaming_sample_rate=streaming_sample_rate,
+            streaming_coreset_rate=streaming_coreset_rate,
+            streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             require_commit=True,
             **kwargs,
@@ -3753,6 +3781,9 @@ class LanceDataset(pa.dataset.Dataset):
         index_uuid: Optional[str] = None,
         *,
         target_partition_size: Optional[int] = None,
+        streaming_sample_rate: Optional[int] = None,
+        streaming_coreset_rate: Optional[int] = None,
+        streaming_refine_passes: Optional[int] = None,
         skip_transpose: bool = False,
         **kwargs,
     ) -> Index:
@@ -3807,6 +3838,9 @@ class LanceDataset(pa.dataset.Dataset):
             fragment_ids=fragment_ids,
             index_uuid=index_uuid,
             target_partition_size=target_partition_size,
+            streaming_sample_rate=streaming_sample_rate,
+            streaming_coreset_rate=streaming_coreset_rate,
+            streaming_refine_passes=streaming_refine_passes,
             skip_transpose=skip_transpose,
             require_commit=False,
             **kwargs,
