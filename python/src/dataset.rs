@@ -542,6 +542,7 @@ impl PyIndexSegmentBuilder {
     ) -> PyResult<PyRefMut<'a, Self>> {
         let normalized = index_type.to_uppercase();
         slf.index_type = Some(match normalized.as_str() {
+            "BITMAP" => IndexType::Bitmap,
             "INVERTED" | "FTS" => IndexType::Inverted,
             "VECTOR" => IndexType::Vector,
             "IVF_FLAT" => IndexType::IvfFlat,
@@ -2447,6 +2448,16 @@ impl Dataset {
             None
         };
 
+        let canonical_bitmap_segment = if let Some(kwargs) = kwargs {
+            kwargs
+                .get_item("__lance_internal_canonical_bitmap_segment")?
+                .and_then(|v| if v.is_none() { None } else { Some(v.extract()) })
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         // Add fragment_ids and index_uuid support
         let has_fragment_ids = fragment_ids.is_some();
         if let Some(fragment_ids) = fragment_ids {
@@ -2457,6 +2468,9 @@ impl Dataset {
         }
         if let Some(progress_handler) = progress_handler.as_ref() {
             builder = builder.progress(progress_handler.progress.clone());
+        }
+        if canonical_bitmap_segment {
+            builder = builder.canonical_bitmap_segment();
         }
 
         use std::future::IntoFuture;

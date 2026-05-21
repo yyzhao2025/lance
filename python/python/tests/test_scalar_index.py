@@ -3980,6 +3980,68 @@ def test_distributed_bitmap_index_build_single_fragment_shards(tmp_path):
     _assert_committed_distributed_bitmap_index(ds, index_id, index_name, fragment_ids)
 
 
+def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
+    dataset_path = tmp_path / "bitmap_segments.lance"
+    ds = generate_multi_fragment_bitmap_dataset(
+        dataset_path, num_fragments=4, rows_per_fragment=40
+    )
+
+    index_name = "bitmap_segment_idx"
+    fragment_ids = [fragment.fragment_id for fragment in ds.get_fragments()]
+    fragment_groups = [
+        fragment_ids[idx : idx + 2] for idx in range(0, len(fragment_ids), 2)
+    ]
+    assert len(fragment_groups) >= 2
+
+    staged_segments = [
+        ds.create_index_uncommitted(
+            column="category",
+            index_type="BITMAP",
+            name=index_name,
+            fragment_ids=fragment_group,
+        )
+        for fragment_group in fragment_groups
+    ]
+
+    assert len({segment.uuid for segment in staged_segments}) == len(staged_segments)
+    for segment, fragment_group in zip(staged_segments, fragment_groups):
+        assert segment.fragment_ids == set(fragment_group)
+        assert any(file.path == "bitmap_page_lookup.lance" for file in segment.files)
+        assert all(not file.path.startswith("part_") for file in segment.files)
+
+    segments = (
+        ds.create_index_segment_builder()
+        .with_index_type("BITMAP")
+        .with_segments(staged_segments)
+        .build_all()
+    )
+    assert len(segments) == len(staged_segments)
+
+    ds = ds.commit_existing_index_segments(index_name, "category", segments)
+    descriptions = {index.name: index for index in ds.describe_indices()}
+    assert len(descriptions[index_name].segments) == len(segments)
+
+    filter_expr = "category = 3"
+    without_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "category"],
+        use_scalar_index=False,
+    ).to_table()
+    with_index = ds.scanner(
+        filter=filter_expr,
+        columns=["id", "category"],
+        use_scalar_index=True,
+    ).to_table()
+
+    assert with_index.num_rows == without_index.num_rows
+    assert with_index["id"].to_pylist() == without_index["id"].to_pylist()
+    assert set(with_index["category"].to_pylist()) == {3}
+    assert (
+        "ScalarIndexQuery"
+        in ds.scanner(filter=filter_expr, use_scalar_index=True).explain_plan()
+    )
+
+
 def test_btree_fragment_ids_parameter_validation(tmp_path):
     """
     Test validation of fragment_ids parameter for B-tree indices.

@@ -11,7 +11,7 @@ use crate::{
         DatasetIndexExt, DatasetIndexInternalExt,
         api::{IndexSegment, IndexSegmentPlan},
         build_index_metadata_from_segments,
-        scalar::build_scalar_index,
+        scalar::{build_bitmap_index_segment, build_scalar_index},
         vector::{
             LANCE_VECTOR_INDEX, VectorIndexParams, build_distributed_vector_index,
             build_empty_vector_index, build_vector_index,
@@ -61,6 +61,7 @@ pub struct CreateIndexBuilder<'a> {
     index_uuid: Option<String>,
     preprocessed_data: Option<Box<dyn RecordBatchReader + Send + 'static>>,
     progress: Arc<dyn IndexBuildProgress>,
+    canonical_bitmap_segment: bool,
     /// Transaction properties to store with this commit.
     transaction_properties: Option<Arc<HashMap<String, String>>>,
 }
@@ -84,6 +85,7 @@ impl<'a> CreateIndexBuilder<'a> {
             index_uuid: None,
             preprocessed_data: None,
             progress: Arc::new(NoopIndexBuildProgress),
+            canonical_bitmap_segment: false,
             transaction_properties: None,
         }
     }
@@ -123,6 +125,16 @@ impl<'a> CreateIndexBuilder<'a> {
 
     pub fn progress(mut self, p: Arc<dyn IndexBuildProgress>) -> Self {
         self.progress = p;
+        self
+    }
+
+    /// Build a Bitmap segment using the canonical Bitmap layout.
+    ///
+    /// Legacy distributed Bitmap builds keep passing fragment ids through to
+    /// the Bitmap plugin so they continue to write shard files.
+    #[doc(hidden)]
+    pub fn canonical_bitmap_segment(mut self) -> Self {
+        self.canonical_bitmap_segment = true;
         self
     }
 
@@ -257,17 +269,49 @@ impl<'a> CreateIndexBuilder<'a> {
                     .preprocessed_data
                     .take()
                     .map(|reader| lance_datafusion::utils::reader_to_stream(Box::new(reader)));
-                build_scalar_index(
-                    self.dataset,
-                    column,
-                    &index_id.to_string(),
-                    &params,
-                    train,
-                    self.fragments.clone(),
-                    preprocesssed_data,
-                    self.progress.clone(),
-                )
-                .await?
+                if self.canonical_bitmap_segment {
+                    if self.index_type != IndexType::Bitmap {
+                        return Err(Error::invalid_input(
+                            "canonical bitmap segment build requires Bitmap index type".to_string(),
+                        ));
+                    }
+                    if !train {
+                        return Err(Error::invalid_input(
+                            "canonical bitmap segment build requires train=true".to_string(),
+                        ));
+                    }
+                    if preprocesssed_data.is_some() {
+                        return Err(Error::invalid_input(
+                            "canonical bitmap segment build does not accept preprocessed data"
+                                .to_string(),
+                        ));
+                    }
+                    let fragments = self.fragments.clone().ok_or_else(|| {
+                        Error::invalid_input(
+                            "canonical bitmap segment build requires fragment ids".to_string(),
+                        )
+                    })?;
+                    build_bitmap_index_segment(
+                        self.dataset,
+                        column,
+                        &index_id.to_string(),
+                        fragments,
+                        self.progress.clone(),
+                    )
+                    .await?
+                } else {
+                    build_scalar_index(
+                        self.dataset,
+                        column,
+                        &index_id.to_string(),
+                        &params,
+                        train,
+                        self.fragments.clone(),
+                        preprocesssed_data,
+                        self.progress.clone(),
+                    )
+                    .await?
+                }
             }
             (IndexType::Scalar, LANCE_SCALAR_INDEX) => {
                 // Guess the index type
@@ -671,6 +715,10 @@ impl<'a> IndexSegmentBuilder<'a> {
         }
 
         match index_type {
+            IndexType::Bitmap => crate::index::scalar::bitmap::plan_segments(
+                &self.segments,
+                self.target_segment_bytes,
+            ),
             IndexType::Inverted => crate::index::scalar::inverted::plan_segments(
                 &self.segments,
                 self.target_segment_bytes,
@@ -712,6 +760,7 @@ impl<'a> IndexSegmentBuilder<'a> {
                     .to_string(),
             )
         })? {
+            IndexType::Bitmap => crate::index::scalar::bitmap::build_segment(plan).await,
             IndexType::Inverted => {
                 crate::index::scalar::inverted::build_segment(self.dataset, plan).await
             }

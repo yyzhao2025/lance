@@ -3901,9 +3901,10 @@ class LanceDataset(pa.dataset.Dataset):
         """
         Create one segment without publishing it and return its metadata.
 
-        This is the public distributed-build API for vector index
-        construction. Unlike :meth:`create_index`, this method does not publish
-        the index into the dataset manifest. Instead, it writes one segment
+        This is the public distributed-build API for vector indices and
+        canonical bitmap scalar segments. Unlike :meth:`create_index`, this
+        method does not publish the index into the dataset manifest. Instead,
+        it writes one segment
         under ``_indices/<segment_uuid>/`` and returns the resulting
         :class:`Index` metadata.
 
@@ -3928,6 +3929,33 @@ class LanceDataset(pa.dataset.Dataset):
         Index
             Metadata for the segment that was written by this call.
         """
+        if isinstance(index_type, str) and index_type.upper() == "BITMAP":
+            if fragment_ids is None:
+                raise ValueError(
+                    "create_index_uncommitted requires fragment_ids "
+                    "for distributed index build"
+                )
+            if not isinstance(column, str):
+                raise NotImplementedError(
+                    "Scalar indices currently only support a single column"
+                )
+
+            kwargs = dict(kwargs)
+            kwargs["fragment_ids"] = fragment_ids
+            kwargs["__lance_internal_canonical_bitmap_segment"] = True
+            if index_uuid is not None:
+                kwargs["index_uuid"] = index_uuid
+
+            return self._ds.create_index(
+                [column],
+                "BITMAP",
+                name,
+                replace,
+                train,
+                storage_options,
+                kwargs,
+            )
+
         return self._create_index_impl(
             column,
             index_type,
