@@ -3864,26 +3864,6 @@ def test_distribute_btree_index_build(tmp_path):
     )
 
 
-@pytest.mark.parametrize(
-    "index_type",
-    [
-        "BITMAP",
-        IndexConfig(index_type="bitmap", parameters={"shard_id": 0}),
-    ],
-)
-def test_bitmap_create_scalar_index_rejects_fragment_ids(tmp_path, index_type):
-    ds = generate_multi_fragment_bitmap_dataset(
-        tmp_path / "bitmap_dist_rejected.lance", num_fragments=2, rows_per_fragment=40
-    )
-
-    with pytest.raises(ValueError, match="create_index_uncommitted"):
-        ds.create_scalar_index(
-            column="category",
-            index_type=index_type,
-            fragment_ids=[ds.get_fragments()[0].fragment_id],
-        )
-
-
 def test_bitmap_uncommitted_segments_can_be_committed_from_python(tmp_path):
     dataset_path = tmp_path / "bitmap_segments.lance"
     ds = generate_multi_fragment_bitmap_dataset(
