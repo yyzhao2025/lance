@@ -525,7 +525,6 @@ mod tests {
                 CreateIndexBuilder::new(&mut dataset, &["value"], IndexType::Bitmap, &params)
                     .name("value_bitmap".to_string())
                     .fragments(fragment_ids.clone())
-                    .canonical_bitmap_segment()
                     .execute_uncommitted()
                     .await
                     .unwrap();

@@ -3051,12 +3051,9 @@ class LanceDataset(pa.dataset.Dataset):
             structure. If False, an empty index will be created that can be
             populated later.
         fragment_ids : List[int], optional
-            If provided, the index will be created only on the specified fragments.
-            This enables distributed/fragment-level indexing. When provided, the
-            method returns metadata for one segment but does not commit
-            the index to the dataset. The segment can be planned, merged, and
-            committed later using the segment builder and commit APIs.
-            This parameter is passed via kwargs internally.
+            If provided, the index will be created only on the specified fragments
+            using the legacy distributed scalar-index path. Bitmap indices do not
+            support this legacy path; use :meth:`create_index_uncommitted` instead.
         index_uuid : str, optional
             A UUID to use for the segment written by this call.
             If not provided, a new UUID will be generated. This parameter is
@@ -3236,11 +3233,22 @@ class LanceDataset(pa.dataset.Dataset):
                     f"Scalar index column {column} cannot currently be a duration"
                 )
         elif isinstance(index_type, IndexConfig):
+            if fragment_ids is not None and index_type.index_type.upper() == "BITMAP":
+                raise ValueError(
+                    "Bitmap distributed indexing uses create_index_uncommitted(..., "
+                    'index_type="BITMAP", fragment_ids=...)'
+                )
             config = json.dumps(index_type.parameters)
             kwargs["config"] = indices.IndexConfig(index_type.index_type, config)
             index_type = "scalar"
         else:
             raise Exception("index_type must be str or IndexConfig")
+
+        if fragment_ids is not None and index_type == "BITMAP":
+            raise ValueError(
+                "Bitmap distributed indexing uses create_index_uncommitted(..., "
+                'index_type="BITMAP", fragment_ids=...)'
+            )
 
         # Add fragment_ids and index_uuid to kwargs if provided
         if fragment_ids is not None:
@@ -3942,7 +3950,6 @@ class LanceDataset(pa.dataset.Dataset):
 
             kwargs = dict(kwargs)
             kwargs["fragment_ids"] = fragment_ids
-            kwargs["__lance_internal_canonical_bitmap_segment"] = True
             if index_uuid is not None:
                 kwargs["index_uuid"] = index_uuid
 
@@ -4031,7 +4038,9 @@ class LanceDataset(pa.dataset.Dataset):
         This method does NOT commit changes.
 
         This API merges temporary scalar index files (for example per-fragment
-        BTree or inverted index outputs).
+        BTree or inverted index outputs). Bitmap distributed indexing uses
+        :meth:`create_index_uncommitted` and :meth:`create_index_segment_builder`
+        instead.
         After this method returns, callers MUST explicitly commit
         the index manifest using lance.LanceDataset.commit(...)
         with a LanceOperation.CreateIndex.
