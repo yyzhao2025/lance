@@ -99,6 +99,13 @@ use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
 use crate::index::DatasetIndexExt;
 use crate::io::commit::{commit_transaction, migrate_fragments};
+use arrow::array::AsArray;
+use arrow::datatypes::{UInt8Type, UInt32Type, UInt64Type};
+use arrow_array::Array;
+use arrow_array::RecordBatch;
+use arrow_array::StructArray;
+use arrow_array::builder::{LargeBinaryBuilder, PrimitiveBuilder, StringBuilder};
+use arrow_schema::DataType as ArrowDataType;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
@@ -859,6 +866,198 @@ impl CompactionPlan {
     }
 }
 
+async fn transform_blob_v2_batch(
+    dataset: &Arc<Dataset>,
+    schema: &lance_core::datatypes::Schema,
+    batch: RecordBatch,
+) -> Result<RecordBatch> {
+    let row_addr_idx = batch
+        .schema()
+        .column_with_name(lance_core::ROW_ADDR)
+        .ok_or_else(|| {
+            Error::internal("_rowaddr column missing from batch for blob v2 compaction")
+        })?
+        .0;
+    let row_addrs = batch.column(row_addr_idx).as_primitive::<UInt64Type>();
+
+    let mut new_columns: Vec<Arc<dyn Array>> = Vec::new();
+    let mut new_fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
+
+    let batch_schema = batch.schema();
+    for (col_idx, field) in batch_schema.fields().iter().enumerate() {
+        if field.name() == lance_core::ROW_ADDR {
+            continue;
+        }
+
+        let lance_field = schema.field(field.name());
+        let is_blob_v2 = lance_field.is_some_and(|f| f.is_blob_v2());
+
+        if !is_blob_v2 {
+            new_columns.push(batch.column(col_idx).clone());
+            new_fields.push(field.clone());
+            continue;
+        }
+
+        let struct_arr = batch
+            .column(col_idx)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .ok_or_else(|| Error::internal("Blob v2 column was not a struct array"))?;
+
+        let kind_col = struct_arr
+            .column_by_name("kind")
+            .ok_or_else(|| Error::internal("Blob v2 descriptor missing `kind` field"))?
+            .as_primitive::<UInt8Type>();
+        let position_col = struct_arr
+            .column_by_name("position")
+            .ok_or_else(|| Error::internal("Blob v2 descriptor missing `position` field"))?
+            .as_primitive::<UInt64Type>();
+        let size_col = struct_arr
+            .column_by_name("size")
+            .ok_or_else(|| Error::internal("Blob v2 descriptor missing `size` field"))?
+            .as_primitive::<UInt64Type>();
+        let blob_uri_col = struct_arr
+            .column_by_name("blob_uri")
+            .ok_or_else(|| Error::internal("Blob v2 descriptor missing `blob_uri` field"))?
+            .as_string::<i32>();
+        let blob_id_col = struct_arr
+            .column_by_name("blob_id")
+            .ok_or_else(|| Error::internal("Blob v2 descriptor missing `blob_id` field"))?
+            .as_primitive::<UInt32Type>();
+
+        let num_rows = struct_arr.len();
+
+        let mut non_null_non_external_addrs: Vec<u64> = Vec::new();
+        let mut row_kind: Vec<Option<u8>> = Vec::with_capacity(num_rows);
+
+        for i in 0..num_rows {
+            if struct_arr.is_null(i) || kind_col.is_null(i) {
+                row_kind.push(None);
+            } else {
+                let kind_val = kind_col.value(i);
+                if kind_val == lance_core::datatypes::BlobKind::External as u8 {
+                    row_kind.push(Some(kind_val));
+                } else if kind_val == lance_core::datatypes::BlobKind::Inline as u8
+                    && position_col.is_null(i)
+                    && size_col.is_null(i)
+                {
+                    row_kind.push(None);
+                } else {
+                    row_kind.push(Some(kind_val));
+                    non_null_non_external_addrs.push(row_addrs.value(i));
+                }
+            }
+        }
+
+        let column_name = field.name();
+        let blob_files = if non_null_non_external_addrs.is_empty() {
+            Vec::new()
+        } else {
+            super::blob::take_blobs_by_addresses(dataset, &non_null_non_external_addrs, column_name)
+                .await?
+        };
+
+        let mut blob_data: Vec<bytes::Bytes> = Vec::with_capacity(blob_files.len());
+        for bf in &blob_files {
+            blob_data.push(bf.read().await?);
+        }
+
+        let mut data_builder = LargeBinaryBuilder::with_capacity(num_rows, 0);
+        let mut uri_builder = StringBuilder::with_capacity(num_rows, 0);
+        let mut out_position_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
+        let mut out_size_builder = PrimitiveBuilder::<UInt64Type>::with_capacity(num_rows);
+
+        let mut blob_data_idx = 0;
+        #[allow(clippy::needless_range_loop)]
+        for i in 0..num_rows {
+            match row_kind[i] {
+                None => {
+                    data_builder.append_null();
+                    uri_builder.append_null();
+                    out_position_builder.append_null();
+                    out_size_builder.append_null();
+                }
+                Some(kind_val) => {
+                    if kind_val == lance_core::datatypes::BlobKind::External as u8 {
+                        data_builder.append_null();
+                        let base_id = blob_id_col.value(i);
+                        let uri_val = blob_uri_col.value(i);
+                        if base_id == 0 {
+                            uri_builder.append_value(uri_val);
+                        } else {
+                            let base =
+                                dataset.manifest().base_paths.get(&base_id).ok_or_else(|| {
+                                    Error::internal(format!(
+                                        "External blob references unknown base_id {}",
+                                        base_id
+                                    ))
+                                })?;
+                            let absolute_uri =
+                                format!("{}/{}", base.path.trim_end_matches('/'), uri_val);
+                            uri_builder.append_value(&absolute_uri);
+                        }
+                        if position_col.is_null(i) {
+                            out_position_builder.append_null();
+                        } else {
+                            out_position_builder.append_value(position_col.value(i));
+                        }
+                        if size_col.is_null(i) {
+                            out_size_builder.append_null();
+                        } else {
+                            out_size_builder.append_value(size_col.value(i));
+                        }
+                    } else {
+                        let data = &blob_data[blob_data_idx];
+                        blob_data_idx += 1;
+                        data_builder.append_value(data.as_ref());
+                        uri_builder.append_null();
+                        out_position_builder.append_null();
+                        out_size_builder.append_null();
+                    }
+                }
+            }
+        }
+
+        let child_fields = vec![
+            arrow_schema::Field::new("data", ArrowDataType::LargeBinary, true),
+            arrow_schema::Field::new("uri", ArrowDataType::Utf8, true),
+            arrow_schema::Field::new("position", ArrowDataType::UInt64, true),
+            arrow_schema::Field::new("size", ArrowDataType::UInt64, true),
+        ];
+
+        let new_struct = StructArray::try_new(
+            child_fields.clone().into(),
+            vec![
+                Arc::new(data_builder.finish()),
+                Arc::new(uri_builder.finish()),
+                Arc::new(out_position_builder.finish()),
+                Arc::new(out_size_builder.finish()),
+            ],
+            struct_arr.nulls().cloned(),
+        )?;
+
+        new_columns.push(Arc::new(new_struct));
+        new_fields.push(Arc::new(
+            arrow_schema::Field::new(
+                field.name(),
+                ArrowDataType::Struct(child_fields.into()),
+                field.is_nullable(),
+            )
+            .with_metadata(field.metadata().clone()),
+        ));
+    }
+
+    let new_schema = Arc::new(arrow_schema::Schema::new_with_metadata(
+        new_fields
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect::<Vec<_>>(),
+        batch_schema.metadata().clone(),
+    ));
+
+    Ok(RecordBatch::try_new(new_schema, new_columns)?)
+}
+
 /// Build a scan reader for rewrite and optionally capture row IDs.
 ///
 /// Parameters:
@@ -888,12 +1087,19 @@ async fn prepare_reader(
     Option<std::sync::mpsc::Receiver<CapturedRowIds>>,
 )> {
     let mut scanner = dataset.scan();
-    let has_blob_columns = dataset
+    let has_legacy_blob_columns = dataset
         .schema()
         .fields_pre_order()
-        .any(|field| field.is_blob());
-    if has_blob_columns {
+        .any(|field| field.is_blob() && !field.is_blob_v2());
+    if has_legacy_blob_columns {
         scanner.blob_handling(BlobHandling::AllBinary);
+    }
+    let has_blob_v2_columns = dataset
+        .schema()
+        .fields_pre_order()
+        .any(|field| field.is_blob_v2());
+    if has_blob_v2_columns {
+        scanner.with_row_address();
     }
     if let Some(bs) = batch_size {
         scanner.batch_size(bs);
@@ -1195,16 +1401,76 @@ async fn rewrite_files(
                 num_rows,
             );
         });
-        reader = Some(Box::pin(RecordBatchStreamAdapter::new(
-            schema,
-            reader_with_progress,
-        )));
+
+        let has_blob_v2_columns = dataset
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob_v2());
+
+        if has_blob_v2_columns {
+            let dataset_arc = Arc::new(dataset.as_ref().clone());
+            let dataset_schema = dataset.schema().clone();
+            let transformed = reader_with_progress.then(move |batch_result| {
+                let dataset = dataset_arc.clone();
+                let schema = dataset_schema.clone();
+                async move {
+                    let batch = batch_result?;
+                    transform_blob_v2_batch(&dataset, &schema, batch)
+                        .await
+                        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))
+                }
+            });
+            let transformed_schema = {
+                let mut fields: Vec<Arc<arrow_schema::Field>> = Vec::new();
+                for field in schema.fields().iter() {
+                    if field.name() == lance_core::ROW_ADDR {
+                        continue;
+                    }
+                    let lance_field = dataset.schema().field(field.name());
+                    if lance_field.is_some_and(|f| f.is_blob_v2()) {
+                        let child_fields = vec![
+                            arrow_schema::Field::new("data", ArrowDataType::LargeBinary, true),
+                            arrow_schema::Field::new("uri", ArrowDataType::Utf8, true),
+                            arrow_schema::Field::new("position", ArrowDataType::UInt64, true),
+                            arrow_schema::Field::new("size", ArrowDataType::UInt64, true),
+                        ];
+                        fields.push(Arc::new(
+                            arrow_schema::Field::new(
+                                field.name(),
+                                ArrowDataType::Struct(child_fields.into()),
+                                field.is_nullable(),
+                            )
+                            .with_metadata(field.metadata().clone()),
+                        ));
+                    } else {
+                        fields.push(field.clone());
+                    }
+                }
+                Arc::new(arrow_schema::Schema::new_with_metadata(
+                    fields
+                        .iter()
+                        .map(|f| f.as_ref().clone())
+                        .collect::<Vec<_>>(),
+                    schema.metadata().clone(),
+                ))
+            };
+            reader = Some(Box::pin(RecordBatchStreamAdapter::new(
+                transformed_schema,
+                transformed,
+            )));
+        } else {
+            reader = Some(Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                reader_with_progress,
+            )));
+        }
     }
 
     let mut params = WriteParams {
         max_rows_per_file: options.target_rows_per_fragment,
         max_rows_per_group: options.max_rows_per_group,
         mode: WriteMode::Append,
+        allow_external_blob_outside_bases: true,
         ..Default::default()
     };
     if let Some(max_bytes_per_file) = options.max_bytes_per_file {
@@ -4815,5 +5081,76 @@ mod tests {
             row_count, 0,
             "rows deleted before compaction must not be resurrected; found {row_count}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_compact_blob_v2_preserves_external_references() {
+        use crate::BlobArrayBuilder;
+        use lance_core::utils::tempfile::TempDir;
+        use lance_table::format::BasePath;
+
+        let test_dir = TempDir::default();
+        let external_dir = TempDir::default();
+        let external_path = external_dir.std_path().join("external.bin");
+        std::fs::write(&external_path, b"external-data").unwrap();
+        let external_uri = format!("file://{}", external_path.display());
+        let base_uri = format!("file://{}", external_dir.std_path().display());
+
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_uri(external_uri.clone()).unwrap();
+        blob_builder.push_bytes(b"inline-data").unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let id_array: ArrayRef = Arc::new(Int32Array::from(vec![0, 1]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema.clone());
+
+        let mut dataset = Dataset::write(
+            reader,
+            &test_dir.path_str(),
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                max_rows_per_file: 1,
+                initial_bases: Some(vec![BasePath {
+                    id: 1,
+                    name: Some("external".to_string()),
+                    path: base_uri,
+                    is_dataset_root: false,
+                }]),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 2);
+
+        for frag in dataset.get_fragments() {
+            let rows = frag.physical_rows().await.unwrap();
+            assert!(rows > 0, "fragment {} should have rows", frag.id());
+        }
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1024 * 1024,
+            ..Default::default()
+        };
+        let plan = plan_compaction(&dataset, &options).await.unwrap();
+        assert!(
+            !plan.tasks().is_empty(),
+            "compaction plan should have tasks, got {} tasks",
+            plan.tasks().len()
+        );
+
+        compact_files(&mut dataset, options, None).await.unwrap();
+
+        assert_eq!(dataset.get_fragments().len(), 1);
+
+        let scan_result = dataset.scan().try_into_batch().await.unwrap();
+        assert_eq!(scan_result.num_rows(), 2);
     }
 }
