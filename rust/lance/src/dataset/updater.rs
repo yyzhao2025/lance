@@ -12,7 +12,9 @@ use lance_table::utils::stream::ReadBatchFutStream;
 use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
-use super::write::{GenericWriter, open_writer};
+use super::write::{
+    GenericWriter, WriterOptions, build_writer_options_for_updater, open_writer_with_options,
+};
 use crate::dataset::FileFragment;
 use crate::dataset::utils::SchemaAdapter;
 
@@ -45,6 +47,8 @@ pub struct Updater {
 
     /// The adapter to convert the logical data to physical data.
     schema_adapter: Option<SchemaAdapter>,
+
+    writer_options: Option<WriterOptions>,
 
     finished: bool,
 
@@ -85,6 +89,10 @@ impl Updater {
 
         let input_stream = reader.read_all(batch_size).await?;
 
+        let writer_options = build_writer_options_for_updater(fragment.dataset(), false)
+            .await
+            .ok();
+
         Ok(Self {
             fragment,
             input_stream,
@@ -95,6 +103,7 @@ impl Updater {
             // The schema adapter needs the data schema, not the logical schema, so it can't be
             // created until after the first batch is read.
             schema_adapter: None,
+            writer_options,
             finished: false,
             deletion_restorer: DeletionRestorer::new(deletion_vector, legacy_batch_size),
         })
@@ -146,11 +155,17 @@ impl Updater {
             .data_storage_format
             .lance_file_version()?;
 
-        open_writer(
+        let writer_options = self.writer_options.take().unwrap_or_else(|| WriterOptions {
+            add_data_dir: true,
+            ..Default::default()
+        });
+
+        open_writer_with_options(
             &self.fragment.dataset().object_store,
             &schema,
             &self.fragment.dataset().base,
             data_storage_version,
+            writer_options,
         )
         .await
     }

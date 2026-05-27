@@ -1050,19 +1050,56 @@ pub async fn open_writer(
     .await
 }
 
-#[derive(Default)]
-struct WriterOptions {
-    add_data_dir: bool,
-    base_id: Option<u32>,
-    external_base_resolver: Option<Arc<ExternalBaseResolver>>,
-    allow_external_blob_outside_bases: bool,
-    external_blob_mode: ExternalBlobMode,
-    source_store_registry: Arc<ObjectStoreRegistry>,
-    source_store_params: ObjectStoreParams,
-    blob_pack_file_size_threshold: Option<usize>,
+pub(super) struct WriterOptions {
+    pub add_data_dir: bool,
+    pub base_id: Option<u32>,
+    pub external_base_resolver: Option<Arc<ExternalBaseResolver>>,
+    pub allow_external_blob_outside_bases: bool,
+    pub external_blob_mode: ExternalBlobMode,
+    pub source_store_registry: Arc<ObjectStoreRegistry>,
+    pub source_store_params: ObjectStoreParams,
+    pub blob_pack_file_size_threshold: Option<usize>,
 }
 
-async fn open_writer_with_options(
+impl Default for WriterOptions {
+    fn default() -> Self {
+        Self {
+            add_data_dir: false,
+            base_id: None,
+            external_base_resolver: None,
+            allow_external_blob_outside_bases: false,
+            external_blob_mode: ExternalBlobMode::Reference,
+            source_store_registry: Arc::new(ObjectStoreRegistry::default()),
+            source_store_params: ObjectStoreParams::default(),
+            blob_pack_file_size_threshold: None,
+        }
+    }
+}
+
+pub(super) async fn build_writer_options_for_updater(
+    dataset: &Dataset,
+    allow_external_blob_outside_bases: bool,
+) -> Result<WriterOptions> {
+    let store_registry = dataset.session().store_registry();
+    let external_base_resolver =
+        build_external_base_resolver(Some(dataset), &WriteParams::default())
+            .await
+            .ok()
+            .map(Arc::new);
+    let source_store_params = dataset.store_params.as_deref().cloned().unwrap_or_default();
+    Ok(WriterOptions {
+        add_data_dir: true,
+        base_id: None,
+        external_base_resolver,
+        allow_external_blob_outside_bases,
+        external_blob_mode: ExternalBlobMode::Reference,
+        source_store_registry: store_registry,
+        source_store_params,
+        blob_pack_file_size_threshold: None,
+    })
+}
+
+pub(super) async fn open_writer_with_options(
     object_store: &ObjectStore,
     schema: &Schema,
     base_dir: &Path,
