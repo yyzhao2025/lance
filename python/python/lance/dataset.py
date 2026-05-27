@@ -2349,6 +2349,7 @@ class LanceDataset(pa.dataset.Dataset):
         read_columns: List[str] | None = None,
         reader_schema: Optional[pa.Schema] = None,
         batch_size: Optional[int] = None,
+        allow_external_blob_outside_bases: bool = False,
     ):
         """
         Add new columns with defined values.
@@ -2388,6 +2389,9 @@ class LanceDataset(pa.dataset.Dataset):
         batch_size: int, optional
             The number of rows to read at a time from the source dataset when applying
             the transform.  This is ignored if the dataset is a v1 dataset.
+        allow_external_blob_outside_bases: bool, optional
+            If True, allow external blob columns to reference URIs outside the
+            registered external bases. Default is False.
 
         Examples
         --------
@@ -2432,10 +2436,14 @@ class LanceDataset(pa.dataset.Dataset):
 
         transforms = normalize_transform(transforms, self, read_columns, reader_schema)
         if isinstance(transforms, pa.RecordBatchReader):
-            self._ds.add_columns_from_reader(transforms, batch_size)
+            self._ds.add_columns_from_reader(
+                transforms, batch_size, allow_external_blob_outside_bases
+            )
             return
         else:
-            self._ds.add_columns(transforms, read_columns, batch_size)
+            self._ds.add_columns(
+                transforms, read_columns, batch_size, allow_external_blob_outside_bases
+            )
 
             if isinstance(transforms, BatchUDF):
                 if transforms.cache is not None:

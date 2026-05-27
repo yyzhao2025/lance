@@ -239,6 +239,7 @@ pub(super) async fn add_columns_to_fragments(
     read_columns: Option<Vec<String>>,
     fragments: &[FileFragment],
     batch_size: Option<u32>,
+    allow_external_blob_outside_bases: bool,
 ) -> Result<(Vec<Fragment>, Schema)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
@@ -271,6 +272,7 @@ pub(super) async fn add_columns_to_fragments(
                 batch_size,
                 udf.result_checkpoint,
                 None,
+                allow_external_blob_outside_bases,
             )
             .await?;
             Result::Ok((udf.output_schema, fragments))
@@ -336,21 +338,43 @@ pub(super) async fn add_columns_to_fragments(
             let mapper = Box::new(mapper);
 
             let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
-            let fragments =
-                add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
+            let fragments = add_columns_impl(
+                fragments,
+                read_columns,
+                mapper,
+                batch_size,
+                None,
+                None,
+                allow_external_blob_outside_bases,
+            )
+            .await?;
             Ok((output_schema, fragments))
         }
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
             check_names(output_schema.as_ref())?;
-            let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
+            let fragments = add_columns_from_stream(
+                fragments,
+                stream,
+                None,
+                batch_size,
+                allow_external_blob_outside_bases,
+            )
+            .await?;
             Ok((output_schema, fragments))
         }
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
             let stream = reader.into_stream();
-            let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
+            let fragments = add_columns_from_stream(
+                fragments,
+                stream,
+                None,
+                batch_size,
+                allow_external_blob_outside_bases,
+            )
+            .await?;
             Ok((output_schema, fragments))
         }
         NewColumnTransform::AllNulls(output_schema) => {
@@ -394,6 +418,7 @@ pub(super) async fn add_columns(
     transforms: NewColumnTransform,
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
+    allow_external_blob_outside_bases: bool,
 ) -> Result<()> {
     let (fragments, schema) = add_columns_to_fragments(
         dataset,
@@ -401,6 +426,7 @@ pub(super) async fn add_columns(
         read_columns,
         &dataset.get_fragments(),
         batch_size,
+        allow_external_blob_outside_bases,
     )
     .await?;
 
@@ -421,6 +447,7 @@ async fn add_columns_impl(
     batch_size: Option<u32>,
     result_cache: Option<Arc<dyn UDFCheckpointStore>>,
     schemas: Option<(Schema, Schema)>,
+    allow_external_blob_outside_bases: bool,
 ) -> Result<Vec<Fragment>> {
     let read_columns_ref = read_columns.as_deref();
     let mapper_ref = mapper.as_ref();
@@ -438,7 +465,12 @@ async fn add_columns_impl(
                 }
 
                 let mut updater = fragment
-                    .updater(read_columns_ref, schemas_ref.clone(), batch_size)
+                    .updater(
+                        read_columns_ref,
+                        schemas_ref.clone(),
+                        batch_size,
+                        allow_external_blob_outside_bases,
+                    )
                     .await?;
 
                 let mut batch_index = 0;
@@ -485,12 +517,18 @@ async fn add_columns_from_stream(
     mut stream: SendableRecordBatchStream,
     schemas: Option<(Schema, Schema)>,
     batch_size: Option<u32>,
+    allow_external_blob_outside_bases: bool,
 ) -> Result<Vec<Fragment>> {
     let mut new_fragments = Vec::with_capacity(fragments.len());
     let mut last_seen_batch: Option<RecordBatch> = None;
     for fragment in fragments {
         let mut updater = fragment
-            .updater::<String>(Some(&[]), schemas.clone(), batch_size)
+            .updater::<String>(
+                Some(&[]),
+                schemas.clone(),
+                batch_size,
+                allow_external_blob_outside_bases,
+            )
             .await?;
         while let Some(batch) = updater.next().await? {
             debug_assert_eq!(batch.num_columns(), 1);
@@ -660,6 +698,7 @@ pub(super) async fn alter_columns(
             None,
             None,
             Some((new_col_schema, new_schema.clone())),
+            false,
         )
         .await?;
 
@@ -813,6 +852,7 @@ mod test {
             NewColumnTransform::SqlExpressions(vec![("id".into(), "id + 1".into())]),
             None,
             None,
+            false,
         );
         // (Quick validation that the future is Send)
         let res = require_send(fut).await;
@@ -824,6 +864,7 @@ mod test {
                 NewColumnTransform::SqlExpressions(vec![("value".into(), "2 * random()".into())]),
                 None,
                 None,
+                false,
             )
             .await?;
 
@@ -833,6 +874,7 @@ mod test {
                 NewColumnTransform::SqlExpressions(vec![("double_id".into(), "2 * id".into())]),
                 None,
                 None,
+                false,
             )
             .await?;
 
@@ -845,6 +887,7 @@ mod test {
                 )]),
                 None,
                 None,
+                false,
             )
             .await?;
 
@@ -908,7 +951,7 @@ mod test {
             )])),
             result_checkpoint: None,
         });
-        let res = dataset.add_columns(transforms, None, None).await;
+        let res = dataset.add_columns(transforms, None, None, false).await;
         assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         // Can add a column that independent (empty read_schema)
@@ -931,7 +974,7 @@ mod test {
             output_schema,
             result_checkpoint: None,
         });
-        dataset.add_columns(transforms, None, None).await?;
+        dataset.add_columns(transforms, None, None, false).await?;
 
         // Can add a column that depends on another column (double id)
         let output_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -958,7 +1001,7 @@ mod test {
             output_schema,
             result_checkpoint: None,
         });
-        dataset.add_columns(transforms, None, None).await?;
+        dataset.add_columns(transforms, None, None, false).await?;
         // These can be read back, the dataset is valid
         dataset.validate().await?;
 
@@ -1087,7 +1130,7 @@ mod test {
             output_schema,
             result_checkpoint: Some(request_counter.clone()),
         });
-        dataset.add_columns(transforms, None, None).await?;
+        dataset.add_columns(transforms, None, None, false).await?;
 
         // Should have requested both fragments
         assert_eq!(
@@ -1181,6 +1224,7 @@ mod test {
                 )]))),
                 None,
                 None,
+                false,
             )
             .await?;
 
@@ -1201,6 +1245,7 @@ mod test {
                     ]))),
                     None,
                     None,
+                    false,
                 )
                 .await
                 .unwrap_err();
@@ -1258,6 +1303,7 @@ mod test {
                     ]))),
                     None,
                     None,
+                    false,
                 )
                 .await
                 .unwrap_err();
@@ -2116,6 +2162,7 @@ mod test {
                 NewColumnTransform::SqlExpressions(vec![("x".into(), "i + 1".into())]),
                 Some(vec!["i".into()]),
                 None,
+                false,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 1);
@@ -2128,6 +2175,7 @@ mod test {
                 NewColumnTransform::SqlExpressions(vec![("y".into(), "2 * i".into())]),
                 Some(vec!["i".into()]),
                 None,
+                false,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 1);
@@ -2154,6 +2202,7 @@ mod test {
                 ]),
                 Some(vec!["i".into()]),
                 None,
+                false,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 2);
@@ -2168,6 +2217,7 @@ mod test {
                 NewColumnTransform::SqlExpressions(vec![("c".into(), "i + 11".into())]),
                 Some(vec!["i".into()]),
                 None,
+                false,
             )
             .await?;
         assert_eq!(dataset.manifest.max_field_id(), 3);
@@ -2232,6 +2282,7 @@ mod test {
                 )]),
                 None,
                 None,
+                false,
             )
             .await
             .unwrap();
@@ -2290,6 +2341,7 @@ mod test {
                 )]),
                 None,
                 None,
+                false,
             )
             .await
             .unwrap();

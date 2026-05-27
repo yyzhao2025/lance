@@ -51,6 +51,7 @@ async fn test_add_sub_column_to_packed_struct_col(
             ))),
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -85,6 +86,7 @@ async fn test_add_sub_column_to_struct_col_unsupported(
             ))),
             None,
             None,
+            false,
         )
         .await
         .unwrap_err();
@@ -113,6 +115,7 @@ async fn test_add_sub_column_to_struct_col(
             ))),
             None,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -322,6 +325,7 @@ async fn prepare_initial_dataset_with_struct_col(
             NewColumnTransform::Reader(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))),
             None,
             None,
+            false,
         )
         .await;
     assert!(res.is_err());
@@ -418,6 +422,7 @@ async fn test_add_sub_column_to_list_struct_col(
             ))),
             None,
             None,
+            false,
         )
         .await
         .unwrap();

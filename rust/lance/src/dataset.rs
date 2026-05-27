@@ -2905,8 +2905,16 @@ impl Dataset {
         transforms: NewColumnTransform,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
+        allow_external_blob_outside_bases: bool,
     ) -> Result<()> {
-        schema_evolution::add_columns(self, transforms, read_columns, batch_size).await
+        schema_evolution::add_columns(
+            self,
+            transforms,
+            read_columns,
+            batch_size,
+            allow_external_blob_outside_bases,
+        )
+        .await
     }
 
     /// Modify columns in the dataset, changing their name, type, or nullability.

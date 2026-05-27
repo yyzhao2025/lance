@@ -1546,6 +1546,7 @@ impl FileFragment {
         columns: Option<&[T]>,
         schemas: Option<(Schema, Schema)>,
         batch_size: Option<u32>,
+        allow_external_blob_outside_bases: bool,
     ) -> Result<Updater> {
         let mut schema = self.dataset.schema().clone();
 
@@ -1579,7 +1580,15 @@ impl FileFragment {
         let reader = reader?;
         let deletion_vector = deletion_vector?.unwrap_or_default().as_ref().clone();
 
-        Updater::try_new(self.clone(), reader, deletion_vector, schemas, batch_size).await
+        Updater::try_new(
+            self.clone(),
+            reader,
+            deletion_vector,
+            schemas,
+            batch_size,
+            allow_external_blob_outside_bases,
+        )
+        .await
     }
 
     pub async fn merge_columns(
@@ -1634,7 +1643,9 @@ impl FileFragment {
     }
 
     pub(crate) async fn merge(mut self, join_column: &str, joiner: &HashJoiner) -> Result<Self> {
-        let mut updater = self.updater(Some(&[join_column]), None, None).await?;
+        let mut updater = self
+            .updater(Some(&[join_column]), None, None, false)
+            .await?;
 
         while let Some(batch) = updater.next().await? {
             let batch = joiner
@@ -1718,6 +1729,7 @@ impl FileFragment {
                 Some(&read_columns),
                 Some((write_schema.clone(), self.schema().clone())),
                 None,
+                false,
             )
             .await?;
         // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
@@ -1798,6 +1810,7 @@ impl FileFragment {
             read_columns,
             std::slice::from_ref(self),
             batch_size,
+            false,
         )
         .await?;
         assert_eq!(fragments.len(), 1);
@@ -2944,6 +2957,7 @@ mod tests {
                 NewColumnTransform::SqlExpressions(vec![("col1".into(), "-1".into())]),
                 None,
                 None,
+                false,
             )
             .await;
         let mut fragment1 = dataset.get_fragment(0).unwrap();
@@ -3025,6 +3039,7 @@ mod tests {
                 NewColumnTransform::SqlExpressions(vec![("col2".into(), "false".into())]),
                 None,
                 None,
+                false,
             )
             .await;
         let mut fragment2 = dataset1.get_fragment(0).unwrap();
@@ -3638,7 +3653,10 @@ mod tests {
             }
 
             let fragment = &mut dataset.get_fragment(0).unwrap();
-            let mut updater = fragment.updater(Some(&["i"]), None, None).await.unwrap();
+            let mut updater = fragment
+                .updater(Some(&["i"]), None, None, false)
+                .await
+                .unwrap();
             let new_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
                 "double_i",
                 DataType::Int32,
@@ -3892,7 +3910,7 @@ mod tests {
         let fragment = dataset.get_fragments().pop().unwrap();
 
         // Write batch_s using add_columns
-        let mut updater = fragment.updater(Some(&["i"]), None, None).await?;
+        let mut updater = fragment.updater(Some(&["i"]), None, None, false).await?;
         updater.next().await?;
         updater.update(batch_s.clone()).await?;
         let frag = updater.finish().await?;

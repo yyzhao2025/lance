@@ -69,6 +69,7 @@ impl Updater {
         deletion_vector: DeletionVector,
         schemas: Option<(Schema, Schema)>,
         batch_size: Option<u32>,
+        allow_external_blob_outside_bases: bool,
     ) -> Result<Self> {
         let (write_schema, final_schema) = if let Some((write_schema, final_schema)) = schemas {
             (Some(write_schema), Some(final_schema))
@@ -89,9 +90,10 @@ impl Updater {
 
         let input_stream = reader.read_all(batch_size).await?;
 
-        let writer_options = build_writer_options_for_updater(fragment.dataset(), false)
-            .await
-            .ok();
+        let writer_options =
+            build_writer_options_for_updater(fragment.dataset(), allow_external_blob_outside_bases)
+                .await
+                .ok();
 
         Ok(Self {
             fragment,

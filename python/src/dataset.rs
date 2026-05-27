@@ -2886,11 +2886,12 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (reader, batch_size = None))]
+    #[pyo3(signature = (reader, batch_size = None, allow_external_blob_outside_bases = false))]
     fn add_columns_from_reader(
         &mut self,
         reader: &Bound<'_, PyAny>,
         batch_size: Option<u32>,
+        allow_external_blob_outside_bases: bool,
     ) -> PyResult<()> {
         let batches = ArrowArrayStreamReader::from_pyarrow_bound(reader)?;
 
@@ -2899,7 +2900,14 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
             .spawn(None, async move {
-                new_self.add_columns(transforms, None, batch_size).await?;
+                new_self
+                    .add_columns(
+                        transforms,
+                        None,
+                        batch_size,
+                        allow_external_blob_outside_bases,
+                    )
+                    .await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
@@ -2908,13 +2916,14 @@ impl Dataset {
         Ok(())
     }
 
-    #[pyo3(signature = (transforms, read_columns = None, batch_size = None))]
+    #[pyo3(signature = (transforms, read_columns = None, batch_size = None, allow_external_blob_outside_bases = false))]
     fn add_columns(
         &mut self,
         py: Python<'_>,
         transforms: &Bound<'_, PyAny>,
         read_columns: Option<Vec<String>>,
         batch_size: Option<u32>,
+        allow_external_blob_outside_bases: bool,
     ) -> PyResult<()> {
         let transforms = transforms_from_python(py, transforms)?;
 
@@ -2922,7 +2931,12 @@ impl Dataset {
         let new_self = rt()
             .spawn(None, async move {
                 new_self
-                    .add_columns(transforms, read_columns, batch_size)
+                    .add_columns(
+                        transforms,
+                        read_columns,
+                        batch_size,
+                        allow_external_blob_outside_bases,
+                    )
                     .await?;
                 Ok(new_self)
             })?
@@ -2941,7 +2955,7 @@ impl Dataset {
         let mut new_self = self.ds.as_ref().clone();
         let new_self = rt()
             .spawn(None, async move {
-                new_self.add_columns(transform, None, None).await?;
+                new_self.add_columns(transform, None, None, false).await?;
                 Ok(new_self)
             })?
             .map_err(|err: lance::Error| PyIOError::new_err(err.to_string()))?;
