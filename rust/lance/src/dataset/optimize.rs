@@ -93,7 +93,7 @@ use super::transaction::{
     Operation, RewriteGroup, RewrittenIndex, Transaction, TransactionBuilder,
 };
 use super::utils::make_rowid_capture_stream;
-use super::{WriteMode, WriteParams, write_fragments_internal};
+use super::{WriteMode, WriteParams, cleanup_data_fragments, write_fragments_internal};
 use crate::Dataset;
 use crate::Result;
 use crate::dataset::utils::CapturedRowIds;
@@ -1654,26 +1654,39 @@ async fn rewrite_files(
 
     log::info!("Compaction task {}: file written", task_id);
 
-    let row_addrs = if let Some(row_ids_rx) = row_ids_rx {
-        let captured_ids = row_ids_rx
-            .try_recv()
-            .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
-        let row_addrs = captured_ids.row_addrs(None).into_owned();
-        let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
-        row_addrs.serialize_into(&mut serialized)?;
-        Some(serialized)
-    } else {
-        if dataset.manifest.uses_stable_row_ids() {
-            log::info!("Compaction task {}: rechunking stable row ids", task_id);
-            rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
-            recalc_versions_for_rewritten_fragments(
-                dataset.as_ref(),
-                &mut new_fragments,
-                &fragments,
-            )
-            .await?;
+    // Wrap in an async block so `?` returns into `row_addrs_result` and we can
+    // run cleanup before propagating the error.
+    let row_addrs_result: Result<Option<Vec<u8>>> = async {
+        if let Some(row_ids_rx) = row_ids_rx {
+            let captured_ids = row_ids_rx
+                .try_recv()
+                .map_err(|err| Error::internal(format!("Failed to receive row ids: {}", err)))?;
+            let row_addrs = captured_ids.row_addrs(None).into_owned();
+            let mut serialized = Vec::with_capacity(row_addrs.serialized_size());
+            row_addrs.serialize_into(&mut serialized)?;
+            Ok(Some(serialized))
+        } else {
+            if dataset.manifest.uses_stable_row_ids() {
+                log::info!("Compaction task {}: rechunking stable row ids", task_id);
+                rechunk_stable_row_ids(dataset.as_ref(), &mut new_fragments, &fragments).await?;
+                recalc_versions_for_rewritten_fragments(
+                    dataset.as_ref(),
+                    &mut new_fragments,
+                    &fragments,
+                )
+                .await?;
+            }
+            Ok(None)
         }
-        None
+    }
+    .await;
+
+    let row_addrs = match row_addrs_result {
+        Ok(v) => v,
+        Err(e) => {
+            cleanup_data_fragments(&dataset.object_store, &dataset.base, &new_fragments).await;
+            return Err(e);
+        }
     };
 
     metrics.files_removed = task
@@ -1995,6 +2008,13 @@ pub async fn commit_compaction(
         None
     };
 
+    // Collect new fragment paths before moving rewrite_groups into the transaction,
+    // so we can clean them up if the commit fails.
+    let all_new_fragments: Vec<Fragment> = rewrite_groups
+        .iter()
+        .flat_map(|g| g.new_fragments.iter().cloned())
+        .collect();
+
     let transaction = TransactionBuilder::new(
         // Use the version at which the compaction tasks were *planned*, not the
         // version of the dataset handle passed to this function.  In distributed
@@ -2013,9 +2033,13 @@ pub async fn commit_compaction(
     .transaction_properties(options.transaction_properties.clone())
     .build();
 
-    dataset
+    if let Err(e) = dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await?;
+        .await
+    {
+        cleanup_data_fragments(&dataset.object_store, &dataset.base, &all_new_fragments).await;
+        return Err(e);
+    }
 
     Ok(metrics)
 }
@@ -5219,6 +5243,10 @@ mod tests {
             .count()
     }
 
+    /// Site 2 in PR #6320: when `commit_compaction` fails to apply the commit
+    /// after `rewrite_files` has already written new data files, those files
+    /// must be cleaned up. We force the commit failure by injecting an error on
+    /// writes to the `_transactions/` directory.
     #[tokio::test]
     async fn test_commit_compaction_cleans_up_data_on_commit_failure() {
         use crate::dataset::builder::DatasetBuilder;
@@ -5227,6 +5255,8 @@ mod tests {
 
         let test_dir = TempStrDir::default();
         let test_uri = test_dir.as_str();
+        // Prefix `/` so Windows drive letters (e.g. `C:`) don't get parsed as
+        // the URL authority.
         let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
         let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
 
@@ -5237,6 +5267,10 @@ mod tests {
             &routed_uri,
             Some(WriteParams {
                 max_rows_per_file: 100,
+                // Stable row IDs lets `commit_compaction` skip the
+                // `reserve_fragment_ids` pre-commit (which would otherwise fail
+                // *before* the new data files exist), isolating the failure to
+                // the `apply_commit` call we want to test.
                 enable_stable_row_ids: true,
                 ..Default::default()
             }),
@@ -5247,6 +5281,11 @@ mod tests {
         let baseline_files = count_data_files_in(test_uri);
 
         let failing = Arc::new(FailingProxyStore::new());
+        // `commit_compaction` first calls `reserve_fragment_ids` (which writes a
+        // ReserveFragments transaction) and then calls `apply_commit` for the
+        // rewrite itself. Skip the first transaction write so the reserve
+        // succeeds, and fail the second so `apply_commit` errors out — that's
+        // the branch we want to exercise cleanup for.
         failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
         failing.fail_after_n(
             "put_multipart",
