@@ -5243,10 +5243,12 @@ mod tests {
                 count += count_all_files_in(&path)?;
             } else if path.is_file() {
                 // Ignore macOS system files if any
-                if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
-                    if !file_name.starts_with('.') {
-                        count += 1;
-                    }
+                if path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|file_name| !file_name.starts_with('.'))
+                {
+                    count += 1;
                 }
             }
         }

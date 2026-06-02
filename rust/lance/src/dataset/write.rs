@@ -666,14 +666,15 @@ pub(crate) async fn cleanup_data_fragments(
                     .and_then(|s| s.to_str())
                 {
                     let blob_dir = data_dir.clone().join(stem);
-                    if let Err(e) = object_store.remove_dir_all(blob_dir.clone()).await {
-                        if !matches!(e, Error::NotFound { .. }) {
+                    match object_store.remove_dir_all(blob_dir.clone()).await {
+                        Err(e) if !matches!(e, Error::NotFound { .. }) => {
                             log::warn!(
                                 "Failed to clean up orphaned blob dir '{}': {}",
                                 blob_dir,
                                 e
                             );
                         }
+                        _ => {}
                     }
                 }
             } else {
