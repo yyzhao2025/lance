@@ -5232,15 +5232,30 @@ mod tests {
         );
     }
 
+    fn count_all_files_in(dir: &std::path::Path) -> std::io::Result<usize> {
+        if !dir.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                count += count_all_files_in(&path)?;
+            } else if path.is_file() {
+                // Ignore macOS system files if any
+                if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+                    if !file_name.starts_with('.') {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        Ok(count)
+    }
+
     fn count_data_files_in(base_dir: &str) -> usize {
         let data_dir = std::path::Path::new(base_dir).join("data");
-        if !data_dir.exists() {
-            return 0;
-        }
-        std::fs::read_dir(data_dir)
-            .unwrap()
-            .filter(|e| e.as_ref().unwrap().path().is_file())
-            .count()
+        count_all_files_in(&data_dir).unwrap_or(0)
     }
 
     /// Site 2 in PR #6320: when `commit_compaction` fails to apply the commit
@@ -5320,6 +5335,87 @@ mod tests {
             count_data_files_in(test_uri),
             baseline_files,
             "Compaction data files should be cleaned up when commit fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_commit_compaction_cleans_up_blob_v2_sidecars_on_commit_failure() {
+        use crate::BlobArrayBuilder;
+        use crate::dataset::builder::DatasetBuilder;
+        use crate::utils::test::FailingProxyStore;
+        use lance_io::object_store::ObjectStoreParams;
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let path_prefix = if test_uri.starts_with('/') { "" } else { "/" };
+        let routed_uri = format!("file-object-store://{path_prefix}{test_uri}");
+
+        let id_array = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        // Use one packed blob and one dedicated blob to verify both sidecar layouts.
+        let packed_data = vec![0u8; 100 * 1024];
+        let dedicated_data = vec![1u8; 5 * 1024 * 1024];
+        let mut blob_builder = BlobArrayBuilder::new(2);
+        blob_builder.push_bytes(&packed_data).unwrap();
+        blob_builder.push_bytes(&dedicated_data).unwrap();
+        let blob_array: ArrayRef = blob_builder.finish().unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            crate::blob_field("blob", true),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![id_array, blob_array]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        Dataset::write(
+            reader,
+            &routed_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1, // Create 2 fragments
+                enable_stable_row_ids: true,
+                data_storage_version: Some(lance_file::version::LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let baseline_files = count_data_files_in(test_uri);
+
+        let failing = Arc::new(FailingProxyStore::new());
+        failing.fail_after_n("put", "_transactions", 1, "injected commit failure");
+        failing.fail_after_n(
+            "put_multipart",
+            "_transactions",
+            1,
+            "injected commit failure",
+        );
+
+        let mut dataset = DatasetBuilder::from_uri(&routed_uri)
+            .with_read_params(crate::dataset::ReadParams {
+                store_options: Some(ObjectStoreParams {
+                    object_store_wrapper: Some(failing.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .load()
+            .await
+            .unwrap();
+
+        let options = CompactionOptions {
+            target_rows_per_fragment: 1000,
+            ..Default::default()
+        };
+        let result = compact_files(&mut dataset, options, None).await;
+        assert!(
+            result.is_err(),
+            "Compaction should fail when transaction commit fails"
+        );
+
+        assert_eq!(
+            count_data_files_in(test_uri),
+            baseline_files,
+            "Blob v2 sidecars should be cleaned up when commit fails"
         );
     }
 
