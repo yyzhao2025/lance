@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use super::fragment::FileFragment;
 use super::{
     Dataset,
     transaction::{Operation, Transaction},
+    write::cleanup_data_fragments,
 };
 use crate::{Error, Result, io::exec::Planner};
 use arrow::compute::CastOptions;
@@ -406,11 +410,63 @@ pub(super) async fn add_columns(
 
     let operation = Operation::Merge { fragments, schema };
     let transaction = Transaction::new(dataset.manifest.version, operation, None);
-    dataset
+    match dataset
         .apply_commit(transaction, &Default::default(), &Default::default())
-        .await?;
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            cleanup_new_column_data_files(&dataset.get_fragments(), &fragments).await;
+            Err(e)
+        }
+    }
+}
 
-    Ok(())
+async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments: &[Fragment]) {
+    let Some(first_fragment) = fragments.first() else {
+        return;
+    };
+
+    let original_files_by_fragment = fragments
+        .iter()
+        .map(|fragment| {
+            let files = fragment
+                .metadata
+                .files
+                .iter()
+                .map(|file| (file.base_id, file.path.clone()))
+                .collect::<HashSet<_>>();
+            (fragment.id() as u64, files)
+        })
+        .collect::<HashMap<_, _>>();
+
+    let fragments_to_cleanup = new_fragments
+        .iter()
+        .filter_map(|fragment| {
+            let original_files = original_files_by_fragment.get(&fragment.id)?;
+            let files = fragment
+                .files
+                .iter()
+                .filter(|file| !original_files.contains(&(file.base_id, file.path.clone())))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if files.is_empty() {
+                None
+            } else {
+                let mut fragment = fragment.clone();
+                fragment.files = files;
+                Some(fragment)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    cleanup_data_fragments(
+        &first_fragment.dataset().object_store,
+        &first_fragment.dataset().base,
+        &fragments_to_cleanup,
+    )
+    .await;
 }
 
 #[allow(clippy::type_complexity)]
@@ -424,60 +480,68 @@ async fn add_columns_impl(
 ) -> Result<Vec<Fragment>> {
     let read_columns_ref = read_columns.as_deref();
     let mapper_ref = mapper.as_ref();
-    let fragments = futures::stream::iter(fragments)
-        .then(|fragment| {
-            let cache_ref = result_cache.clone();
-            let schemas_ref = &schemas;
-            async move {
-                if let Some(cache) = &cache_ref {
-                    let fragment_id = fragment.id() as u32;
-                    let fragment = cache.get_fragment(fragment_id)?;
-                    if let Some(fragment) = fragment {
-                        return Ok(fragment);
-                    }
+
+    let mut new_fragments = Vec::with_capacity(fragments.len());
+
+    for fragment in fragments {
+        let fragment_result = async {
+            if let Some(cache) = &result_cache {
+                let fragment_id = fragment.id() as u32;
+                let fragment = cache.get_fragment(fragment_id)?;
+                if let Some(fragment) = fragment {
+                    return Ok(fragment);
                 }
-
-                let mut updater = fragment
-                    .updater(read_columns_ref, schemas_ref.clone(), batch_size)
-                    .await?;
-
-                let mut batch_index = 0;
-                // TODO: the structure of the updater prevents batch-level parallelism here,
-                //       but there is no reason why we couldn't do this in parallel.
-                while let Some(batch) = updater.next().await? {
-                    let batch_info = BatchInfo {
-                        fragment_id: fragment.id() as u32,
-                        batch_index,
-                    };
-
-                    let new_batch = if let Some(cache) = &cache_ref {
-                        if let Some(batch) = cache.get_batch(&batch_info)? {
-                            batch
-                        } else {
-                            let new_batch = mapper_ref(batch)?;
-                            cache.insert_batch(batch_info, new_batch.clone())?;
-                            new_batch
-                        }
-                    } else {
-                        mapper_ref(batch)?
-                    };
-
-                    updater.update(new_batch).await?;
-                    batch_index += 1;
-                }
-
-                let fragment = updater.finish().await?;
-
-                if let Some(cache) = &cache_ref {
-                    cache.insert_fragment(fragment.clone())?;
-                }
-
-                Ok::<_, Error>(fragment)
             }
-        })
-        .try_collect::<Vec<_>>()
-        .await?;
-    Ok(fragments)
+
+            let mut updater = fragment
+                .updater(read_columns_ref, schemas.clone(), batch_size)
+                .await?;
+
+            let mut batch_index = 0;
+            // TODO: the structure of the updater prevents batch-level parallelism here,
+            //       but there is no reason why we couldn't do this in parallel.
+            while let Some(batch) = updater.next().await? {
+                let batch_info = BatchInfo {
+                    fragment_id: fragment.id() as u32,
+                    batch_index,
+                };
+
+                let new_batch = if let Some(cache) = &result_cache {
+                    if let Some(batch) = cache.get_batch(&batch_info)? {
+                        batch
+                    } else {
+                        let new_batch = mapper_ref(batch)?;
+                        cache.insert_batch(batch_info, new_batch.clone())?;
+                        new_batch
+                    }
+                } else {
+                    mapper_ref(batch)?
+                };
+
+                updater.update(new_batch).await?;
+                batch_index += 1;
+            }
+
+            let new_fragment = updater.finish().await?;
+
+            if let Some(cache) = &result_cache {
+                cache.insert_fragment(new_fragment.clone())?;
+            }
+
+            Ok::<_, Error>(new_fragment)
+        }
+        .await;
+
+        match fragment_result {
+            Ok(new_fragment) => new_fragments.push(new_fragment),
+            Err(e) => {
+                cleanup_new_column_data_files(fragments, &new_fragments).await;
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(new_fragments)
 }
 
 async fn add_columns_from_stream(
@@ -492,46 +556,58 @@ async fn add_columns_from_stream(
         let mut updater = fragment
             .updater::<String>(Some(&[]), schemas.clone(), batch_size)
             .await?;
-        while let Some(batch) = updater.next().await? {
-            debug_assert_eq!(batch.num_columns(), 1);
-            let mut rows_remaining = batch.num_rows();
+        let result: Result<Fragment> = async {
+            while let Some(batch) = updater.next().await? {
+                debug_assert_eq!(batch.num_columns(), 1);
+                let mut rows_remaining = batch.num_rows();
 
-            let mut batches = Vec::new();
+                let mut batches = Vec::new();
 
-            while rows_remaining > 0 {
-                let next_batch = if let Some(last_seen_batch) = last_seen_batch {
-                    last_seen_batch
-                } else {
-                    stream.next().await.ok_or_else(|| {
-                        Error::invalid_input(
-                            "Stream ended before producing values for all rows in dataset",
-                        )
-                    })??
-                };
-                let num_rows = next_batch.num_rows();
-                if num_rows > rows_remaining {
-                    let new_batch = next_batch.slice(0, rows_remaining);
-                    batches.push(new_batch);
-                    last_seen_batch =
-                        Some(next_batch.slice(rows_remaining, num_rows - rows_remaining));
-                    rows_remaining = 0;
-                } else {
-                    batches.push(next_batch);
-                    rows_remaining -= num_rows;
-                    last_seen_batch = None;
+                while rows_remaining > 0 {
+                    let next_batch = if let Some(last_seen) = last_seen_batch.take() {
+                        last_seen
+                    } else {
+                        stream.next().await.ok_or_else(|| {
+                            Error::invalid_input(
+                                "Stream ended before producing values for all rows in dataset",
+                            )
+                        })??
+                    };
+                    let num_rows = next_batch.num_rows();
+                    if num_rows > rows_remaining {
+                        let new_batch = next_batch.slice(0, rows_remaining);
+                        batches.push(new_batch);
+                        last_seen_batch =
+                            Some(next_batch.slice(rows_remaining, num_rows - rows_remaining));
+                        rows_remaining = 0;
+                    } else {
+                        batches.push(next_batch);
+                        rows_remaining -= num_rows;
+                        last_seen_batch = None;
+                    }
                 }
+
+                let new_batch =
+                    arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
+
+                updater.update(new_batch).await?;
             }
-
-            let new_batch =
-                arrow_select::concat::concat_batches(&batches[0].schema(), batches.iter())?;
-
-            updater.update(new_batch).await?;
+            Ok(updater.finish().await?)
         }
-        new_fragments.push(updater.finish().await?);
+        .await;
+
+        match result {
+            Ok(new_fragment) => new_fragments.push(new_fragment),
+            Err(e) => {
+                cleanup_new_column_data_files(fragments, &new_fragments).await;
+                return Err(e);
+            }
+        }
     }
 
     // Ensure the stream is fully consumed
     if last_seen_batch.is_some() || stream.next().await.is_some() {
+        cleanup_new_column_data_files(fragments, &new_fragments).await;
         return Err(Error::invalid_input_source(
             "Stream produced more values than expected for dataset".into(),
         ));
@@ -762,8 +838,7 @@ pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> R
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::{collections::HashMap, fs, path::Path as StdPath, sync::Mutex};
 
     use crate::dataset::WriteParams;
     use arrow_array::{
@@ -774,11 +849,53 @@ mod test {
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
+    use lance_table::format::BasePath;
     use rstest::rstest;
 
     // Used to validate that futures returned are Send.
     fn require_send<T: Send>(t: T) -> T {
         t
+    }
+
+    fn file_paths_in(dir: impl AsRef<StdPath>) -> Vec<String> {
+        fn collect_files(
+            base_dir: &StdPath,
+            dir: &StdPath,
+            files: &mut Vec<String>,
+        ) -> std::io::Result<()> {
+            if !dir.exists() {
+                return Ok(());
+            }
+            for entry in std::fs::read_dir(dir)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    collect_files(base_dir, &path, files)?;
+                } else if path.is_file()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|file_name| !file_name.starts_with('.'))
+                {
+                    files.push(
+                        path.strip_prefix(base_dir)
+                            .unwrap()
+                            .to_string_lossy()
+                            .to_string(),
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        let base_dir = dir.as_ref();
+        let mut files = Vec::new();
+        collect_files(base_dir, base_dir, &mut files).unwrap();
+        files.sort();
+        files
+    }
+
+    fn data_file_paths_in(base_dir: &str) -> Vec<String> {
+        file_paths_in(StdPath::new(base_dir).join("data"))
     }
 
     #[tokio::test]
@@ -860,6 +977,95 @@ mod test {
         ]);
         assert_eq!(data.schema().as_ref(), &expected_schema);
         assert_eq!(data.num_rows(), num_rows);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[tokio::test]
+    async fn test_add_columns_cleans_up_blob_v2_data_on_stream_error(
+        #[values(
+            ("inline", b"inline".to_vec()),
+            ("packed", vec![1u8; 128 * 1024]),
+            ("dedicated", vec![2u8; 5 * 1024 * 1024]),
+            ("external", b"external".to_vec())
+        )]
+        blob_case: (&str, Vec<u8>),
+    ) -> Result<()> {
+        let (blob_kind, payload) = blob_case;
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema.clone());
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let external_dir = tempfile::tempdir()?;
+        let external_path = external_dir.path().join("blob.bin");
+        fs::write(&external_path, &payload)?;
+        let external_baseline_files = file_paths_in(external_dir.path());
+        let external_baseline_payload = fs::read(&external_path)?;
+
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                initial_bases: Some(vec![BasePath::new(
+                    1,
+                    external_dir.path().to_string_lossy().to_string(),
+                    Some("external".to_string()),
+                    false,
+                )]),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let mut blob_builder = crate::BlobArrayBuilder::new(2);
+        if blob_kind == "external" {
+            blob_builder.push_uri(external_path.to_string_lossy())?;
+        } else {
+            blob_builder.push_bytes(payload)?;
+        }
+        blob_builder.push_bytes(b"extra")?;
+        let blob_array = blob_builder.finish()?;
+        let blob_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let blob_batch = RecordBatch::try_new(blob_schema.clone(), vec![blob_array])?;
+        let reader = RecordBatchIterator::new(vec![Ok(blob_batch)], blob_schema);
+
+        let err = dataset
+            .add_columns(NewColumnTransform::Reader(Box::new(reader)), None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Stream produced more values than expected for dataset")
+        );
+
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean up new data files and blob v2 sidecars on failure"
+        );
+        assert_eq!(
+            file_paths_in(external_dir.path()),
+            external_baseline_files,
+            "cleanup must not delete external files"
+        );
+        assert_eq!(
+            fs::read(&external_path)?,
+            external_baseline_payload,
+            "cleanup must not modify external files"
+        );
+        dataset.validate().await?;
 
         Ok(())
     }

@@ -1140,6 +1140,39 @@ pub async fn open_writer(
     .await
 }
 
+pub(super) async fn open_update_writer(
+    dataset: &Dataset,
+    schema: &Schema,
+    storage_version: LanceFileVersion,
+) -> Result<Box<dyn GenericWriter>> {
+    // add_columns / alter_columns reuse the normal writer stack, but they do not
+    // flow through WriteParams. Rebuild the external base resolver here so blob
+    // v2 reference columns can resolve dataset-registered external URIs.
+    let external_base_resolver = if storage_version >= LanceFileVersion::V2_2
+        && schema.fields.iter().any(|f| f.is_blob_v2())
+    {
+        Some(Arc::new(
+            build_external_base_resolver(Some(dataset), &WriteParams::default()).await?,
+        ))
+    } else {
+        None
+    };
+
+    open_writer_with_options(
+        &dataset.object_store,
+        schema,
+        &dataset.base,
+        storage_version,
+        WriterOptions {
+            add_data_dir: true,
+            external_base_resolver,
+            source_store_registry: dataset.session.store_registry(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 #[derive(Default)]
 struct WriterOptions {
     add_data_dir: bool,

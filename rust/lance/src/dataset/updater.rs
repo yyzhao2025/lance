@@ -12,7 +12,7 @@ use lance_table::utils::stream::ReadBatchFutStream;
 use super::Dataset;
 use super::fragment::FragmentReader;
 use super::scanner::get_default_batch_size;
-use super::write::{GenericWriter, open_writer};
+use super::write::{GenericWriter, open_update_writer};
 use crate::dataset::FileFragment;
 use crate::dataset::utils::SchemaAdapter;
 
@@ -146,13 +146,7 @@ impl Updater {
             .data_storage_format
             .lance_file_version()?;
 
-        open_writer(
-            &self.fragment.dataset().object_store,
-            &schema,
-            &self.fragment.dataset().base,
-            data_storage_version,
-        )
-        .await
+        open_update_writer(self.dataset(), &schema, data_storage_version).await
     }
 
     /// Update one batch.

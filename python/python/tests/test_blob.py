@@ -45,6 +45,34 @@ def _external_blob_table(blob_path, payload=b"hello"):
     return pa.table({"blob": lance.blob_array([blob_path.as_uri()])})
 
 
+def _add_columns_blob_v2_values(tmp_path):
+    external_base = tmp_path / "external_base"
+    external_blob = external_base / "external_blob.bin"
+    external_blob.parent.mkdir(parents=True, exist_ok=True)
+    external_blob.write_bytes(b"external")
+
+    payloads = [
+        b"inline",
+        b"p" * (64 * 1024 + 1024),
+        b"d" * (4 * 1024 * 1024 + 1024),
+        b"external",
+    ]
+    values = [payloads[0], payloads[1], payloads[2], external_blob.as_uri()]
+    initial_bases = [DatasetBasePath(external_base.as_uri(), name="external", id=1)]
+    return values, payloads, initial_bases
+
+
+def _assert_blob_v2_add_columns_result(dataset, column, payloads):
+    desc = dataset.to_table(columns=[column]).column(column).chunk(0)
+
+    assert desc.field("kind").to_pylist() == [0, 1, 2, 3]
+    assert desc.field("blob_id").to_pylist()[3] == 1
+    assert desc.field("blob_uri").to_pylist()[3] == "external_blob.bin"
+
+    blobs = dataset.take_blobs(column, indices=range(len(payloads)))
+    assert [blob.readall() for blob in blobs] == payloads
+
+
 def _out_of_order_blob_selection(dataset_with_blobs, selection_kind):
     addresses = _blob_row_addresses(dataset_with_blobs)
     expected = [(addresses[4], b"quux"), (addresses[0], b"foo")]
@@ -606,6 +634,54 @@ def test_blob_extension_write_external_ingest_rejects_reference_only_options(tmp
             external_blob_mode="ingest",
             allow_external_blob_outside_bases=True,
         )
+
+
+def test_blob_extension_add_columns_record_batch_reader_all_kinds(tmp_path):
+    values, payloads, initial_bases = _add_columns_blob_v2_values(tmp_path)
+    ds = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "test_add_columns_reader_blob_v2",
+        data_storage_version="2.2",
+        initial_bases=initial_bases,
+    )
+
+    ds.add_columns(pa.table({"blob": lance.blob_array(values)}).to_reader())
+
+    _assert_blob_v2_add_columns_result(ds, "blob", payloads)
+
+
+def test_blob_extension_add_columns_batch_udf_all_kinds(tmp_path):
+    values, payloads, initial_bases = _add_columns_blob_v2_values(tmp_path)
+    ds = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "test_add_columns_udf_blob_v2",
+        data_storage_version="2.2",
+        initial_bases=initial_bases,
+    )
+
+    @lance.batch_udf(output_schema=pa.schema([lance.blob_field("blob")]))
+    def make_blob_column(batch):
+        return pa.record_batch(
+            [lance.blob_array([values[row.as_py()] for row in batch["id"]])],
+            ["blob"],
+        )
+
+    ds.add_columns(make_blob_column, read_columns=["id"])
+
+    _assert_blob_v2_add_columns_result(ds, "blob", payloads)
+
+
+def test_blob_extension_add_columns_all_nulls_blob_v2(tmp_path):
+    ds = lance.write_dataset(
+        pa.table({"id": range(4)}),
+        tmp_path / "test_add_columns_all_nulls_blob_v2",
+        data_storage_version="2.2",
+    )
+
+    ds.add_columns(lance.blob_field("blob"))
+
+    assert ds.to_table(columns=["blob"]).column("blob").to_pylist() == [None] * 4
+    assert ds.take_blobs("blob", indices=range(4)) == []
 
 
 def test_blob_extension_write_fragments_external_denied_by_default(tmp_path):
