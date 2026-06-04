@@ -243,7 +243,7 @@ pub(super) async fn add_columns_to_fragments(
     read_columns: Option<Vec<String>>,
     fragments: &[FileFragment],
     batch_size: Option<u32>,
-) -> Result<(Vec<Fragment>, Schema)> {
+) -> Result<(Vec<Fragment>, Schema, Vec<Fragment>)> {
     // Check names early (before calling add_columns_impl) to avoid extra work if
     // the names are wrong.
     let version = dataset.manifest.data_storage_format.lance_file_version()?;
@@ -265,10 +265,10 @@ pub(super) async fn add_columns_to_fragments(
     }
     let transforms = optimizer.optimize(dataset, transforms)?;
 
-    let (output_schema, fragments) = match transforms {
+    let (output_schema, new_fragments, fragments_to_cleanup) = match transforms {
         NewColumnTransform::BatchUDF(udf) => {
             check_names(udf.output_schema.as_ref())?;
-            let fragments = add_columns_impl(
+            let result = add_columns_impl(
                 fragments,
                 read_columns,
                 udf.mapper,
@@ -277,7 +277,11 @@ pub(super) async fn add_columns_to_fragments(
                 None,
             )
             .await?;
-            Result::Ok((udf.output_schema, fragments))
+            Result::Ok((
+                udf.output_schema,
+                result.fragments,
+                result.fragments_to_cleanup,
+            ))
         }
         NewColumnTransform::SqlExpressions(expressions) => {
             // We just transform the SQL expression into a UDF backed by DataFusion
@@ -340,22 +344,22 @@ pub(super) async fn add_columns_to_fragments(
             let mapper = Box::new(mapper);
 
             let read_columns = Some(read_schema.field_names().into_iter().cloned().collect());
-            let fragments =
+            let result =
                 add_columns_impl(fragments, read_columns, mapper, batch_size, None, None).await?;
-            Ok((output_schema, fragments))
+            Ok((output_schema, result.fragments, result.fragments_to_cleanup))
         }
         NewColumnTransform::Stream(stream) => {
             let output_schema = stream.schema();
             check_names(output_schema.as_ref())?;
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
-            Ok((output_schema, fragments))
+            Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::Reader(reader) => {
             let output_schema = reader.schema();
             check_names(output_schema.as_ref())?;
             let stream = reader.into_stream();
             let fragments = add_columns_from_stream(fragments, stream, None, batch_size).await?;
-            Ok((output_schema, fragments))
+            Ok((output_schema, fragments.clone(), fragments))
         }
         NewColumnTransform::AllNulls(output_schema) => {
             check_names(output_schema.as_ref())?;
@@ -383,14 +387,20 @@ pub(super) async fn add_columns_to_fragments(
                 ));
             }
 
-            Ok((output_schema, fragments))
+            Ok((output_schema, fragments, Vec::new()))
         }
     }?;
 
-    let mut schema = dataset.schema().merge(output_schema.as_ref())?;
+    let mut schema = match dataset.schema().merge(output_schema.as_ref()) {
+        Ok(schema) => schema,
+        Err(e) => {
+            cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
+            return Err(e);
+        }
+    };
     schema.set_field_id(Some(dataset.manifest.max_field_id()));
 
-    Ok((fragments, schema))
+    Ok((new_fragments, schema, fragments_to_cleanup))
 }
 
 pub(super) async fn add_columns(
@@ -399,7 +409,7 @@ pub(super) async fn add_columns(
     read_columns: Option<Vec<String>>,
     batch_size: Option<u32>,
 ) -> Result<()> {
-    let (fragments, schema) = add_columns_to_fragments(
+    let (fragments, schema, fragments_to_cleanup) = add_columns_to_fragments(
         dataset,
         transforms,
         read_columns,
@@ -416,7 +426,7 @@ pub(super) async fn add_columns(
     {
         Ok(()) => Ok(()),
         Err(e) => {
-            cleanup_new_column_data_files(&dataset.get_fragments(), &fragments).await;
+            cleanup_new_column_data_files(&dataset.get_fragments(), &fragments_to_cleanup).await;
             Err(e)
         }
     }
@@ -427,6 +437,9 @@ async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments
         return;
     };
 
+    // add_columns rewrites fragment metadata in place, so cleanup must delete
+    // only files created by the current attempt and must not touch pre-existing
+    // files that still belong to the fragment.
     let original_files_by_fragment = fragments
         .iter()
         .map(|fragment| {
@@ -469,6 +482,15 @@ async fn cleanup_new_column_data_files(fragments: &[FileFragment], new_fragments
     .await;
 }
 
+struct AddColumnFragments {
+    /// Fragments produced by the add-columns operation and returned to the
+    /// caller for the final merge commit.
+    fragments: Vec<Fragment>,
+    /// Uncommitted fragments whose newly written data files must be removed if
+    /// the operation fails before the merge commit completes.
+    fragments_to_cleanup: Vec<Fragment>,
+}
+
 #[allow(clippy::type_complexity)]
 async fn add_columns_impl(
     fragments: &[FileFragment],
@@ -477,26 +499,40 @@ async fn add_columns_impl(
     batch_size: Option<u32>,
     result_cache: Option<Arc<dyn UDFCheckpointStore>>,
     schemas: Option<(Schema, Schema)>,
-) -> Result<Vec<Fragment>> {
+) -> Result<AddColumnFragments> {
     let read_columns_ref = read_columns.as_deref();
     let mapper_ref = mapper.as_ref();
 
     let mut new_fragments = Vec::with_capacity(fragments.len());
+    let mut fragments_to_cleanup = Vec::with_capacity(fragments.len());
 
     for fragment in fragments {
-        let fragment_result = async {
-            if let Some(cache) = &result_cache {
-                let fragment_id = fragment.id() as u32;
-                let fragment = cache.get_fragment(fragment_id)?;
-                if let Some(fragment) = fragment {
-                    return Ok(fragment);
+        if let Some(cache) = &result_cache {
+            let fragment_id = fragment.id() as u32;
+            let fragment = match cache.get_fragment(fragment_id) {
+                Ok(fragment) => fragment,
+                Err(e) => {
+                    cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
+                    return Err(e);
                 }
+            };
+            if let Some(fragment) = fragment {
+                new_fragments.push(fragment);
+                continue;
             }
+        }
 
-            let mut updater = fragment
-                .updater(read_columns_ref, schemas.clone(), batch_size)
-                .await?;
-
+        let mut updater = match fragment
+            .updater(read_columns_ref, schemas.clone(), batch_size)
+            .await
+        {
+            Ok(updater) => updater,
+            Err(e) => {
+                cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
+                return Err(e);
+            }
+        };
+        let fragment_result = async {
             let mut batch_index = 0;
             // TODO: the structure of the updater prevents batch-level parallelism here,
             //       but there is no reason why we couldn't do this in parallel.
@@ -523,9 +559,14 @@ async fn add_columns_impl(
             }
 
             let new_fragment = updater.finish().await?;
+            fragments_to_cleanup.push(new_fragment.clone());
 
             if let Some(cache) = &result_cache {
+                // Once the checkpoint store owns this fragment, retries may load
+                // it back instead of rewriting it. Removing it from the cleanup
+                // set avoids deleting data that has already been checkpointed.
                 cache.insert_fragment(new_fragment.clone())?;
+                fragments_to_cleanup.pop();
             }
 
             Ok::<_, Error>(new_fragment)
@@ -533,15 +574,21 @@ async fn add_columns_impl(
         .await;
 
         match fragment_result {
-            Ok(new_fragment) => new_fragments.push(new_fragment),
+            Ok(new_fragment) => {
+                new_fragments.push(new_fragment);
+            }
             Err(e) => {
-                cleanup_new_column_data_files(fragments, &new_fragments).await;
+                updater.cleanup_unfinished_writer().await;
+                cleanup_new_column_data_files(fragments, &fragments_to_cleanup).await;
                 return Err(e);
             }
         }
     }
 
-    Ok(new_fragments)
+    Ok(AddColumnFragments {
+        fragments: new_fragments,
+        fragments_to_cleanup,
+    })
 }
 
 async fn add_columns_from_stream(
@@ -553,9 +600,16 @@ async fn add_columns_from_stream(
     let mut new_fragments = Vec::with_capacity(fragments.len());
     let mut last_seen_batch: Option<RecordBatch> = None;
     for fragment in fragments {
-        let mut updater = fragment
+        let mut updater = match fragment
             .updater::<String>(Some(&[]), schemas.clone(), batch_size)
-            .await?;
+            .await
+        {
+            Ok(updater) => updater,
+            Err(e) => {
+                cleanup_new_column_data_files(fragments, &new_fragments).await;
+                return Err(e);
+            }
+        };
         let result: Result<Fragment> = async {
             while let Some(batch) = updater.next().await? {
                 debug_assert_eq!(batch.num_columns(), 1);
@@ -592,13 +646,14 @@ async fn add_columns_from_stream(
 
                 updater.update(new_batch).await?;
             }
-            Ok(updater.finish().await?)
+            updater.finish().await
         }
         .await;
 
         match result {
             Ok(new_fragment) => new_fragments.push(new_fragment),
             Err(e) => {
+                updater.cleanup_unfinished_writer().await;
                 cleanup_new_column_data_files(fragments, &new_fragments).await;
                 return Err(e);
             }
@@ -729,7 +784,7 @@ pub(super) async fn alter_columns(
         };
         let mapper = Box::new(mapper);
 
-        let fragments = add_columns_impl(
+        let result = add_columns_impl(
             &dataset.get_fragments(),
             Some(read_columns),
             mapper,
@@ -742,7 +797,8 @@ pub(super) async fn alter_columns(
         // Some data files may no longer contain any columns in the dataset (e.g. if every
         // remaining column has been altered into a different data file) and so we remove them
         let schema_field_ids = new_schema.field_ids().into_iter().collect::<Vec<_>>();
-        let fragments = fragments
+        let fragments = result
+            .fragments
             .into_iter()
             .map(|mut frag| {
                 frag.files.retain(|f| {
@@ -838,7 +894,7 @@ pub fn exclude(source: &Schema, other: &Schema, version: &LanceFileVersion) -> R
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashMap, fs, path::Path as StdPath, sync::Mutex};
+    use std::{collections::HashMap, fs, num::NonZero, path::Path as StdPath, sync::Mutex};
 
     use crate::dataset::WriteParams;
     use arrow_array::{
@@ -849,7 +905,7 @@ mod test {
     use arrow_schema::Fields as ArrowFields;
     use lance_core::utils::tempfile::TempStrDir;
     use lance_file::version::LanceFileVersion;
-    use lance_table::format::BasePath;
+    use lance_table::format::{BasePath, DataFile};
     use rstest::rstest;
 
     // Used to validate that futures returned are Send.
@@ -1066,6 +1122,534 @@ mod test {
             "cleanup must not modify external files"
         );
         dataset.validate().await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_preserves_checkpointed_fragment_files() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let original_fragments = dataset.get_fragments();
+        assert_eq!(original_fragments.len(), 2);
+
+        let data_dir = StdPath::new(test_uri).join("data");
+        let cached_file = data_dir.join("checkpointed.lance");
+        let cached_blob_dir = data_dir.join("checkpointed");
+        fs::write(&cached_file, b"checkpointed data")?;
+        fs::create_dir_all(&cached_blob_dir)?;
+        fs::write(
+            cached_blob_dir.join("00000000000000000000000000000001.blob"),
+            b"blob",
+        )?;
+
+        let mut checkpointed_fragment = original_fragments[0].metadata().clone();
+        checkpointed_fragment.files.push(DataFile::new(
+            "checkpointed.lance",
+            vec![dataset.manifest.max_field_id() + 1],
+            vec![0],
+            2,
+            2,
+            NonZero::new(17),
+            None,
+        ));
+
+        #[derive(Default)]
+        struct CheckpointedFragmentStore {
+            fragment: Mutex<Option<Fragment>>,
+        }
+
+        impl UDFCheckpointStore for CheckpointedFragmentStore {
+            fn get_batch(&self, _info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                Ok(None)
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>> {
+                if fragment_id == 0 {
+                    Ok(self.fragment.lock().unwrap().clone())
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_fragment(&self, _fragment: Fragment) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(|_| Err(Error::invalid_input("injected UDF failure"))),
+            output_schema: Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "checkpointed",
+                DataType::Int32,
+                true,
+            )])),
+            result_checkpoint: Some(Arc::new(CheckpointedFragmentStore {
+                fragment: Mutex::new(Some(checkpointed_fragment)),
+            })),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("injected UDF failure"));
+
+        assert!(
+            cached_file.exists(),
+            "cleanup must not delete fragment files restored from a checkpoint"
+        );
+        assert!(
+            cached_blob_dir.exists(),
+            "cleanup must not delete blob sidecars restored from a checkpoint"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_cleans_current_blob_v2_writer_on_udf_error() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let call_count = Arc::new(Mutex::new(0usize));
+        let mapper_call_count = call_count.clone();
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut call_count = mapper_call_count.lock().unwrap();
+            *call_count += 1;
+            if *call_count == 2 {
+                return Err(Error::invalid_input("injected UDF failure"));
+            }
+
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: None,
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, Some(1))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("injected UDF failure"));
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean files written by the current unfinished writer"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_preserves_checkpointed_blob_v2_fragment_on_checkpoint_lookup_error()
+    -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        struct FailingLookupStore {
+            inserted: Arc<Mutex<Option<Fragment>>>,
+        }
+
+        impl UDFCheckpointStore for FailingLookupStore {
+            fn get_batch(&self, _info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                Ok(None)
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, fragment_id: u32) -> Result<Option<Fragment>> {
+                if fragment_id == 1 {
+                    Err(Error::invalid_input("injected checkpoint lookup failure"))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_fragment(&self, fragment: Fragment) -> Result<()> {
+                *self.inserted.lock().unwrap() = Some(fragment);
+                Ok(())
+            }
+        }
+
+        let inserted = Arc::new(Mutex::new(None));
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: Some(Arc::new(FailingLookupStore {
+                inserted: inserted.clone(),
+            })),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected checkpoint lookup failure")
+        );
+        let inserted = inserted.lock().unwrap().clone().unwrap();
+        let new_file = inserted
+            .files
+            .iter()
+            .find(|file| {
+                file.fields
+                    .iter()
+                    .any(|field| *field > dataset.manifest.max_field_id())
+            })
+            .expect("checkpoint should record the newly written data file");
+        let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
+        let new_blob_dir = StdPath::new(test_uri)
+            .join("data")
+            .join(StdPath::new(&new_file.path).file_stem().unwrap());
+        assert!(
+            new_file_path.exists(),
+            "cleanup must not delete data files after checkpoint takes ownership"
+        );
+        assert!(
+            new_blob_dir.exists(),
+            "cleanup must not delete blob sidecars after checkpoint takes ownership"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_cleans_finished_blob_v2_writer_on_checkpoint_insert_error()
+    -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        struct FailingInsertStore;
+
+        impl UDFCheckpointStore for FailingInsertStore {
+            fn get_batch(&self, _info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                Ok(None)
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, _fragment_id: u32) -> Result<Option<Fragment>> {
+                Ok(None)
+            }
+
+            fn insert_fragment(&self, _fragment: Fragment) -> Result<()> {
+                Err(Error::invalid_input("injected checkpoint insert failure"))
+            }
+        }
+
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: Some(Arc::new(FailingInsertStore)),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected checkpoint insert failure")
+        );
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean finished writer files when checkpoint insert fails"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_cleans_blob_v2_files_on_declared_schema_merge_error() -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..1))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+        let baseline_files = data_file_paths_in(test_uri);
+
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema: Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("declared", DataType::Int32, true),
+                ArrowField::new("declared", DataType::Int32, true),
+            ])),
+            result_checkpoint: None,
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Schema { .. }));
+        assert_eq!(
+            data_file_paths_in(test_uri),
+            baseline_files,
+            "add_columns should clean files written before declared schema merge fails"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_columns_preserves_checkpointed_blob_v2_fragment_after_later_failure()
+    -> Result<()> {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from_iter_values(0..2))],
+        )?;
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let mut dataset = Dataset::write(
+            reader,
+            test_uri,
+            Some(WriteParams {
+                max_rows_per_file: 1,
+                data_storage_version: Some(LanceFileVersion::V2_2),
+                ..Default::default()
+            }),
+        )
+        .await?;
+
+        struct InsertThenFailStore {
+            inserted: Arc<Mutex<Option<Fragment>>>,
+        }
+
+        impl UDFCheckpointStore for InsertThenFailStore {
+            fn get_batch(&self, info: &BatchInfo) -> Result<Option<RecordBatch>> {
+                if info.fragment_id == 1 {
+                    Err(Error::invalid_input("injected later checkpoint failure"))
+                } else {
+                    Ok(None)
+                }
+            }
+
+            fn insert_batch(&self, _info: BatchInfo, _batch: RecordBatch) -> Result<()> {
+                Ok(())
+            }
+
+            fn get_fragment(&self, _fragment_id: u32) -> Result<Option<Fragment>> {
+                Ok(None)
+            }
+
+            fn insert_fragment(&self, fragment: Fragment) -> Result<()> {
+                *self.inserted.lock().unwrap() = Some(fragment);
+                Ok(())
+            }
+        }
+
+        let inserted = Arc::new(Mutex::new(None));
+        let output_schema = Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)]));
+        let mapper = move |batch: &RecordBatch| {
+            let mut blob_builder = crate::BlobArrayBuilder::new(batch.num_rows());
+            for _ in 0..batch.num_rows() {
+                blob_builder.push_bytes(vec![7u8; 5 * 1024 * 1024])?;
+            }
+            Ok(RecordBatch::try_new(
+                Arc::new(ArrowSchema::new(vec![crate::blob_field("blob", true)])),
+                vec![blob_builder.finish()?],
+            )?)
+        };
+        let transforms = NewColumnTransform::BatchUDF(BatchUDF {
+            mapper: Box::new(mapper),
+            output_schema,
+            result_checkpoint: Some(Arc::new(InsertThenFailStore {
+                inserted: inserted.clone(),
+            })),
+        });
+
+        let err = dataset
+            .add_columns(transforms, None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected later checkpoint failure")
+        );
+
+        let inserted = inserted.lock().unwrap().clone().unwrap();
+        let new_file = inserted
+            .files
+            .iter()
+            .find(|file| {
+                file.fields
+                    .iter()
+                    .any(|field| *field > dataset.manifest.max_field_id())
+            })
+            .expect("checkpoint should record the newly written data file");
+        let new_file_path = StdPath::new(test_uri).join("data").join(&new_file.path);
+        let new_blob_dir = StdPath::new(test_uri)
+            .join("data")
+            .join(StdPath::new(&new_file.path).file_stem().unwrap());
+        assert!(
+            new_file_path.exists(),
+            "cleanup must not delete data files after checkpoint takes ownership"
+        );
+        assert!(
+            new_blob_dir.exists(),
+            "cleanup must not delete blob sidecars after checkpoint takes ownership"
+        );
 
         Ok(())
     }

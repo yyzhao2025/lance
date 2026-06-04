@@ -1021,6 +1021,8 @@ pub async fn write_fragments_internal(
 pub trait GenericWriter: Send {
     /// Write the given batches to the file
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()>;
+    /// Get the file path and base ID for the data file being written.
+    fn data_file_path(&self) -> (&str, Option<u32>);
     /// Get the current position in the file
     ///
     /// We use this to know when the file is too large and we need to start
@@ -1046,6 +1048,9 @@ where
 {
     async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
         self.writer.write(batches).await
+    }
+    fn data_file_path(&self) -> (&str, Option<u32>) {
+        (&self.path, self.base_id)
     }
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await? as u64)
@@ -1086,6 +1091,9 @@ impl GenericWriter for V2WriterAdapter {
             }
         }
         Ok(())
+    }
+    fn data_file_path(&self) -> (&str, Option<u32>) {
+        (&self.path, self.base_id)
     }
     async fn tell(&mut self) -> Result<u64> {
         Ok(self.writer.tell().await?)

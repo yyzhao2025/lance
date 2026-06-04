@@ -73,6 +73,28 @@ def _assert_blob_v2_add_columns_result(dataset, column, payloads):
     assert [blob.readall() for blob in blobs] == payloads
 
 
+def _dataset_file_set(dataset_path):
+    return {
+        path.relative_to(dataset_path)
+        for path in dataset_path.rglob("*")
+        if path.is_file()
+    }
+
+
+def _write_two_fragment_blob_v2_seed_dataset(tmp_path, name):
+    values, payloads, initial_bases = _add_columns_blob_v2_values(tmp_path)
+    dataset_path = tmp_path / name
+    ds = lance.write_dataset(
+        pa.table({"id": range(8)}),
+        dataset_path,
+        data_storage_version="2.2",
+        initial_bases=initial_bases,
+        max_rows_per_file=4,
+        max_rows_per_group=4,
+    )
+    return ds, dataset_path, values, payloads
+
+
 def _out_of_order_blob_selection(dataset_with_blobs, selection_kind):
     addresses = _blob_row_addresses(dataset_with_blobs)
     expected = [(addresses[4], b"quux"), (addresses[0], b"foo")]
@@ -648,6 +670,89 @@ def test_blob_extension_add_columns_record_batch_reader_all_kinds(tmp_path):
     ds.add_columns(pa.table({"blob": lance.blob_array(values)}).to_reader())
 
     _assert_blob_v2_add_columns_result(ds, "blob", payloads)
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    [
+        pytest.param("raises_after_first_fragment", id="reader_raises_mid_stream"),
+        pytest.param("wrong_schema", id="reader_yields_wrong_schema"),
+        pytest.param("too_many_rows", id="reader_produces_too_many_rows"),
+    ],
+)
+def test_blob_extension_add_columns_record_batch_reader_failure_cleans_files(
+    tmp_path,
+    failure_mode,
+):
+    ds, dataset_path, values, payloads = _write_two_fragment_blob_v2_seed_dataset(
+        tmp_path,
+        f"test_add_columns_reader_blob_v2_fail_cleanup_{failure_mode}",
+    )
+    external_blob_path = tmp_path / "external_base" / "external_blob.bin"
+    files_before = _dataset_file_set(dataset_path)
+
+    schema = pa.schema([lance.blob_field("blob")])
+    first_fragment_batch = pa.record_batch([lance.blob_array(values)], schema=schema)
+    second_fragment_batch = pa.record_batch([lance.blob_array(values)], schema=schema)
+
+    if failure_mode == "raises_after_first_fragment":
+        match = "reader failed after first fragment"
+
+        def failing_reader():
+            yield first_fragment_batch
+            raise RuntimeError("reader failed after first fragment")
+
+    elif failure_mode == "wrong_schema":
+        match = "field names"
+
+        def failing_reader():
+            yield first_fragment_batch
+            yield pa.record_batch([pa.array(range(4))], ["not_blob"])
+
+    else:
+        match = "Stream produced more values than expected for dataset"
+
+        def failing_reader():
+            yield first_fragment_batch
+            yield second_fragment_batch
+            yield pa.record_batch([lance.blob_array([payloads[0]])], schema=schema)
+
+    with pytest.raises(OSError, match=match):
+        ds.add_columns(failing_reader(), reader_schema=schema)
+
+    assert ds.version == 1
+    assert _dataset_file_set(dataset_path) == files_before
+    assert external_blob_path.exists()
+
+
+def test_blob_extension_add_columns_batch_udf_failure_cleans_files(tmp_path):
+    ds, dataset_path, values, _ = _write_two_fragment_blob_v2_seed_dataset(
+        tmp_path,
+        "test_add_columns_udf_blob_v2_fail_cleanup",
+    )
+    external_blob_path = tmp_path / "external_base" / "external_blob.bin"
+    files_before = _dataset_file_set(dataset_path)
+    call_count = 0
+
+    @lance.batch_udf(output_schema=pa.schema([lance.blob_field("blob")]))
+    def fail_on_second_fragment(batch):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("udf failed after first fragment")
+        blob_values = [values[row.as_py() % len(values)] for row in batch["id"]]
+        return pa.record_batch(
+            [lance.blob_array(blob_values)],
+            ["blob"],
+        )
+
+    with pytest.raises(OSError, match="udf failed after first fragment"):
+        ds.add_columns(fail_on_second_fragment, read_columns=["id"], batch_size=4)
+
+    assert call_count == 2
+    assert ds.version == 1
+    assert _dataset_file_set(dataset_path) == files_before
+    assert external_blob_path.exists()
 
 
 def test_blob_extension_add_columns_batch_udf_all_kinds(tmp_path):
